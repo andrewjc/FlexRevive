@@ -1,3 +1,6 @@
+// Copyright (c) 2026 AndyR007
+// SPDX-License-Identifier: MIT
+
 // FlexRevive, weapon debris for Fallout 4, simulated on the CPU.
 //
 // Every engine address is located by scanning the running executable, and the only game

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 AndyR007
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 // Two chunks resolving against each other.

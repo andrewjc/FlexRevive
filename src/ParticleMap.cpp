@@ -1,3 +1,6 @@
+// Copyright (c) 2026 AndyR007
+// SPDX-License-Identifier: MIT
+
 #include "ParticleMap.h"
 
 namespace flexrevive::particles {

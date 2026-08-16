@@ -1,3 +1,6 @@
+// Copyright (c) 2026 AndyR007
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 // How a piece's mass modulates what a contact does to it, and how a contact against a surface

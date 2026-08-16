@@ -1,3 +1,6 @@
+// Copyright (c) 2026 AndyR007
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 // Redirecting a running executable's imports to your own functions.

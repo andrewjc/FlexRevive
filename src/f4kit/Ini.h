@@ -1,3 +1,6 @@
+// Copyright (c) 2026 AndyR007
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 // Reading a plain Windows INI file, and clamping what comes back.

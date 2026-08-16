@@ -1,3 +1,6 @@
+// Copyright (c) 2026 AndyR007
+// SPDX-License-Identifier: MIT
+
 #include "f4kit/PeImage.h"
 
 #define WIN32_LEAN_AND_MEAN

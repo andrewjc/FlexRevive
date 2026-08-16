@@ -1,3 +1,6 @@
+// Copyright (c) 2026 AndyR007
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 // The debris solver: a CPU rigid-body simulation standing in for the GPU particle library

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 AndyR007
+// SPDX-License-Identifier: MIT
+
 #include "Config.h"
 #include "Fragment.h"
 #include "Collision.h"
