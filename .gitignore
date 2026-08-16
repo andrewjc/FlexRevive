@@ -1,0 +1,21 @@
+# Build output
+build/
+build-analyze/
+out/
+*.pdb
+*.obj
+*.ilk
+*.exp
+*.lib
+
+# The staged plugin binary; the rest of dist/ is checked in
+dist/F4SE/Plugins/FlexRevive.dll
+
+# Editor and tooling
+.vs/
+.vscode/
+*.user
+
+# Local captures and scratch
+fo4-debug.txt
+backup-*/
