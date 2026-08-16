@@ -210,21 +210,6 @@ Heft=1.6
 MaxPieces=32768
 
 [Performance]
-; Run the solver on the GPU where the hardware suits it.
-;
-; The engine needs every debris transform back on the CPU before a frame can be drawn, so a GPU
-; backend has to dispatch its work and then read the results back. That round trip costs about
-; the same whether it carries ten pieces or ten thousand, which means it only pays for itself
-; once there is a lot of debris in the air. Below a couple of thousand pieces the CPU solver is
-; simply faster, and the automatic setting stays on it.
-;
-;   0  off, always use the CPU solver
-;   1  automatic, use the GPU when the hardware and the amount of debris both suit it
-;   2  forced, use it whenever a compute-capable device exists
-;
-; The log says which backend was chosen and why. Range 0 - 2.
-GpuSolver=0
-
 ; How many threads sweep debris against the world, counting the game's own thread.
 ;
 ;   0  size it from your CPU, leaving two threads' worth of headroom for the game
@@ -326,7 +311,6 @@ void Load()
 
     v.maxPieces = ClampI(ReadInt(L"Limits", L"MaxPieces", v.maxPieces), 64, 65536);
 
-    v.gpuSolver = ClampI(ReadInt(L"Performance", L"GpuSolver", v.gpuSolver), 0, 2);
     v.solverThreads = ClampI(ReadInt(L"Performance", L"SolverThreads", v.solverThreads), 0, 16);
 
     log::SetVerbose(v.verboseLog);
@@ -360,7 +344,6 @@ void Apply()
     t.heft = v.heft;
     t.maxPieces = v.maxPieces;
     t.solverThreads = v.solverThreads;
-    t.gpuSolver = v.gpuSolver;
     t.useEngineSpawnData = v.useEngineSpawnData;
     t.realTimestep = v.realTimestep;
     t.engineParticles = v.engineParticles;

@@ -71,9 +71,6 @@ struct Values {
     // how much debris spawns is the engine's decision.
     int maxPieces = 32768;
 
-    // Use a GPU compute backend for the solver where the hardware suits it.
-    // 0 off, 1 automatic, 2 forced.
-    int gpuSolver = 0;
 
     // ---- performance ------------------------------------------------------------------
     // Threads the per-piece sweep spreads across, counting the game thread. 0 sizes it from

@@ -37,8 +37,6 @@ struct Tunables {
     // Threads the per-piece sweep runs across, counting the game thread. 0 sizes it from the
     // machine. Read once when the pool starts, so a change needs a restart.
     int solverThreads = 0;
-    // GPU backend: 0 off, 1 automatic, 2 forced.
-    int gpuSolver = 0;
     // Intercept flexExtCreateInstance for the engine's spawn velocity and chunk size. Off
     // infers both and leaves that import untouched.
     bool useEngineSpawnData = true;

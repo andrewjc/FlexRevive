@@ -1,6 +1,5 @@
 #include "Config.h"
 #include "Fragment.h"
-#include "GpuBackend.h"
 #include "Collision.h"
 #include "Contact.h"
 #include "Response.h"
@@ -217,10 +216,6 @@ struct StepCost {
 StepCost s_cost;
 int s_costSamples = 0;
 int s_costPeak = 0;
-
-gpu::Capability s_device;
-gpu::Backend s_backend = gpu::kBackendCpu;
-gpu::Reason s_backendReason = gpu::kReasonDisabled;
 
 // Neighbourhoods for piece-versus-piece, rebuilt each step.
 grid::PieceGrid s_pieceGrid;
@@ -781,21 +776,6 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
                        s_impacts.size(), shoved);
         }
         s_impacts.clear();
-    }
-
-    // Which backend this step runs on. Reported when it changes, so the log shows the
-    // decision rather than leaving it to be guessed at.
-    {
-        const gpu::Choice choice =
-            gpu::Select(s_device, gpu::ModeFromSetting(g_tune.gpuSolver), s_pieces.count,
-                        gpu::kMinPiecesForGpu);
-        if (choice.backend != s_backend || choice.reason != s_backendReason) {
-            s_backend = choice.backend;
-            s_backendReason = choice.reason;
-            log::Write("solver backend: %s (%s)",
-                       s_backend == gpu::kBackendGpu ? "GPU" : "CPU",
-                       gpu::ReasonText(s_backendReason));
-        }
     }
 
     // Each substep is a complete pass: integrate, sweep, resolve. Waking and settling are
@@ -3555,14 +3535,6 @@ bool Install()
 
     threads::Start(g_tune.solverThreads);
 
-    s_device = gpu::Probe();
-    if (s_device.present)
-        log::Write("graphics device: %s (vendor %04X, device %04X, %llu MB dedicated, "
-                   "compute %s)", s_device.description, s_device.vendorId, s_device.deviceId,
-                   static_cast<unsigned long long>(s_device.dedicatedMemory / (1024 * 1024)),
-                   s_device.computeCapable ? "yes" : "no");
-    else
-        log::Write("graphics device: none found, the solver runs on the CPU");
     return true;
 }
 

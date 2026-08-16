@@ -17,7 +17,6 @@ add_library(FlexRevive SHARED
     src/f4kit/CrashLog.cpp
     src/f4kit/EngineSetting.cpp
     src/Fragment.cpp
-    src/GpuBackend.cpp
     src/f4kit/ImportHook.cpp
     src/f4kit/Ini.cpp
     src/Math3D.cpp
@@ -92,7 +91,6 @@ if(FLEXREVIVE_TESTS)
     flexrevive_test(test_slottracker src/SlotTracker.cpp src/Math3D.cpp)
     flexrevive_test(test_piecegrid src/PieceGrid.cpp)
     flexrevive_test(test_imports  src/f4kit/ImportHook.cpp)
-    flexrevive_test(test_gpubackend src/GpuBackend.cpp)
     flexrevive_test(test_fragment src/Fragment.cpp)
     flexrevive_test(test_scene src/PairContact.cpp src/Response.cpp)
     flexrevive_test(test_terrain src/Collision.cpp src/Math3D.cpp)
