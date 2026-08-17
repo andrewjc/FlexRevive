@@ -4,6 +4,11 @@
 
 * Fixed ForceEnableWeaponDebris appearing to do nothing, so the mod worked only for people who had already set bNVFlexEnable=1 themselves. Every debris mesh the game owns is in Fallout4 - Nvflex.ba2, which is in none of the archive lists in Fallout4.ini; the engine mounts it from code behind a test of bNVFlexEnable that has already run by the time F4SE loads a plugin. Turning the setting on was therefore too late for it, and the game ran with Flex enabled, the solver installed, and no mesh for any chunk to use
 * Added f4kit::archive::Mount, which mounts that archive itself when the setting had to be turned on. The routine is reached from the call site that names the archive rather than from an address, and is accepted only if the rest of the image calls it too, so no build-specific offset is involved
+* Fixed a blast's falloff always being read as quadratic, because linearFalloff was taken from offset 24 of the force field entry, which is the mode field and is always zero. The flag is a byte at offset 40, and the engine writes it as 1
+* Changed the force field entry to be read by named offset, with the layout the engine actually writes written down beside it, since only three of its eleven fields were ever identified
+* Changed the force field log to fire when a blast begins rather than on every call, so it described the first explosion of a session four times over and no later one at all
+* Added a blast line reporting how many settled pieces a force field disturbed, so a blast that arrives and reaches nothing is distinguishable from one that never arrived
+* Changed the wake trace to count blasts separately from movers, which shared a counter and were reported as one
 
 ## 1.1.1
 

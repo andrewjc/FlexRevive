@@ -166,6 +166,10 @@ constexpr size_t kForceFieldSize = 44;
 std::mutex s_solverMutex;
 std::vector<Container*> s_containers;
 std::vector<ForceField> s_forceFields;
+// How many settled pieces the blasts above woke during the current update. A blast that
+// arrives and reaches nothing looks exactly like one that never arrived, and the two want
+// different fixes, so the count is reported rather than inferred.
+int s_blastWoke = 0;
 Pieces s_pieces;
 // Which slots the engine re-seeded on the current flexSetRigids call, so the position and
 // orientation passes agree on what is new.
@@ -195,6 +199,7 @@ std::vector<float> s_prePos;
 bool s_traceWakes = false;
 std::atomic<int> s_wokeCollider{0};
 int s_wokeShock = 0;
+int s_wokeBlast = 0;
 int s_wokeMover = 0;
 int s_wokePair = 0;
 int s_wokeFresh = 0;
@@ -789,9 +794,10 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
     if (s_traceWakes) {
         for (uint8_t r : s_pieces.resting)
             restingBefore += r ? 1 : 0;
-        s_wokeShock = s_wokeMover = s_wokePair = 0;
+        s_wokeShock = s_wokeBlast = s_wokeMover = s_wokePair = 0;
         s_wokeCollider.store(0, std::memory_order_relaxed);
     }
+    s_blastWoke = 0;
 
     const auto stepStart = std::chrono::steady_clock::now();
     double sweepMs = 0.0, pairMs = 0.0, particleMs = 0.0, listMs = 0.0, settleMs = 0.0;
@@ -873,16 +879,18 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
             // as gravity pulls it in and the contact pushes it back out.
             if (i < int(s_pieces.resting.size()) && s_pieces.resting[size_t(i)]) {
                 const float r = (i < int(s_pieces.radii.size())) ? s_pieces.radii[size_t(i)] : 0.0f;
+                bool blasted = false;
                 bool disturbed = false;
 
                 for (const ForceField& f : s_forceFields) {
                     const float d[3] = {pos[0] - f.pos[0], pos[1] - f.pos[1], pos[2] - f.pos[2]};
                     const float dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
                     if (dist2 <= f.radius * f.radius) {
-                        disturbed = true;
+                        blasted = true;
                         break;
                     }
                 }
+                disturbed = blasted;
                 for (size_t k = 0; !disturbed && k < s_movers.size(); ++k) {
                     const Mover& m = s_movers[k];
                     const float d[3] = {pos[0] - m.pos[0], pos[1] - m.pos[1], pos[2] - m.pos[2]};
@@ -894,8 +902,14 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
 
                 if (!disturbed)
                     continue;
-                if (s_traceWakes)
-                    ++s_wokeMover;
+                if (s_traceWakes) {
+                    if (blasted)
+                        ++s_wokeBlast;
+                    else
+                        ++s_wokeMover;
+                }
+                if (blasted)
+                    ++s_blastWoke;
                 s_pieces.resting[size_t(i)] = 0;
             }
             s_stepList.push_back(i);
@@ -1571,15 +1585,31 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
     // Where a burst of waking came from. Six mechanisms can clear a resting flag and they are
     // indistinguishable from outside: the heap stirs. Reported whenever a real share of a
     // settled pile wakes at once.
+    // What a blast reached, said once per blast rather than once per update. An explosion's
+    // field lives for as long as the explosion does, so the first update that finds settled
+    // debris inside it is the interesting one and the rest are the same news repeated.
+    if (!s_forceFields.empty()) {
+        static int loggedBlast = 0;
+        static bool reachedLast = false;
+        const bool reached = s_blastWoke > 0;
+        if (reached && !reachedLast && loggedBlast < 8) {
+            ++loggedBlast;
+            log::Write("blast: %zu force field(s), radius %.0f strength %.0f, disturbed %d "
+                       "settled piece(s)", s_forceFields.size(), s_forceFields[0].radius,
+                       s_forceFields[0].strength, s_blastWoke);
+        }
+        reachedLast = reached;
+    }
+
     if (s_traceWakes) {
-        const int woke = s_wokeShock + s_wokeMover + s_wokePair + s_wokeFresh + s_wokeMigrated +
-                         s_wokeCollider.load(std::memory_order_relaxed);
+        const int woke = s_wokeShock + s_wokeBlast + s_wokeMover + s_wokePair + s_wokeFresh +
+                         s_wokeMigrated + s_wokeCollider.load(std::memory_order_relaxed);
         static int logged = 0;
         if (restingBefore >= 16 && woke * 20 >= restingBefore && logged < 60) {
             ++logged;
-            log::Write("WAKES: %d of %d settled woke, by shock=%d mover=%d collider=%d "
-                       "pair=%d respawn=%d migration=%d",
-                       woke, restingBefore, s_wokeShock, s_wokeMover,
+            log::Write("WAKES: %d of %d settled woke, by shock=%d blast=%d mover=%d "
+                       "collider=%d pair=%d respawn=%d migration=%d",
+                       woke, restingBefore, s_wokeShock, s_wokeBlast, s_wokeMover,
                        s_wokeCollider.load(std::memory_order_relaxed), s_wokePair, s_wokeFresh,
                        s_wokeMigrated);
         }
@@ -3385,8 +3415,20 @@ void WINAPI Shim_flexExtGetParticleData(void* handle, float** particles, float**
 }
 // flexExtSetForceFields(container, forceFields, numForceFields, memory)
 //
-// Each entry is { float position[3]; float radius; float strength; int mode;
-// bool linearFalloff; }. Explosions publish these, and they are what throws debris outward.
+// Explosions publish these, and they are what throws debris outward. The entry this build
+// writes is wider than the published Flex struct and carries fields Flex does not document,
+// so it is read by offset rather than by declaring it:
+//
+//   0, 4, 8  position          16  strength          32  a further scaled value
+//        12  radius            20  a second strength 36  an int, always 1
+//                              24  mode, always 0    40  linear falloff, a byte, always 1
+//                              28  padding
+//
+// Radius comes from the explosion's own radius and strength from its Force, each scaled by
+// the settings entry the engine looked up for that explosion.
+constexpr size_t kFieldRadius = 12;
+constexpr size_t kFieldStrength = 16;
+constexpr size_t kFieldLinearFalloff = 40;
 void WINAPI Shim_flexExtSetForceFields(void* container, const void* fields, int numFields,
                                        int)
 {
@@ -3400,14 +3442,17 @@ void WINAPI Shim_flexExtSetForceFields(void* container, const void* fields, int 
 
     auto base = static_cast<const uint8_t*>(fields);
     for (int i = 0; i < numFields; ++i) {
-        auto f = reinterpret_cast<const float*>(base + size_t(i) * kForceFieldSize);
+        const uint8_t* entry = base + size_t(i) * kForceFieldSize;
+        auto f = reinterpret_cast<const float*>(entry);
         ForceField ff;
         ff.pos[0] = f[0];
         ff.pos[1] = f[1];
         ff.pos[2] = f[2];
-        ff.radius = f[3];
-        ff.strength = f[4];
-        ff.linearFalloff = *reinterpret_cast<const int*>(f + 6) != 0;
+        memcpy(&ff.radius, entry + kFieldRadius, sizeof(ff.radius));
+        memcpy(&ff.strength, entry + kFieldStrength, sizeof(ff.strength));
+        // A byte, not a word: the engine stores the flag with a byte write and the three bytes
+        // above it are never initialised, so reading wider picks up whatever was on its stack.
+        ff.linearFalloff = entry[kFieldLinearFalloff] != 0;
 
         // Reject anything that does not look like a blast, rather than trusting the layout.
         if (!std::isfinite(ff.pos[0]) || !std::isfinite(ff.radius) || ff.radius <= 0.0f ||
@@ -3416,14 +3461,20 @@ void WINAPI Shim_flexExtSetForceFields(void* container, const void* fields, int 
         s_forceFields.push_back(ff);
     }
 
+    // Reported when a blast begins rather than every frame it lasts. The engine republishes a
+    // live explosion's field on every update, so logging each call describes the first
+    // explosion of the session several times over and every later one not at all.
     static int logged = 0;
-    if (!s_forceFields.empty() && logged < 4) {
+    static bool hadFields = false;
+    if (!s_forceFields.empty() && !hadFields && logged < 8) {
         ++logged;
         const ForceField& f = s_forceFields[0];
-        log::Write("force field at (%.0f, %.0f, %.0f) radius=%.0f strength=%.1f "
+        log::Write("force field at (%.0f, %.0f, %.0f) radius=%.0f strength=%.1f falloff=%s "
                    "(%d of %d accepted)", f.pos[0], f.pos[1], f.pos[2], f.radius, f.strength,
-                   int(s_forceFields.size()), numFields);
+                   f.linearFalloff ? "linear" : "quadratic", int(s_forceFields.size()),
+                   numFields);
     }
+    hadFields = !s_forceFields.empty();
 }
 
 // Every entry point this plugin takes over, and what it points at instead.
