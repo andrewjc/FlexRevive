@@ -55,6 +55,38 @@ bool ReadBool(const wchar_t* section, const wchar_t* key, bool fallback)
     return ReadInt(section, key, fallback ? 1 : 0) != 0;
 }
 
+int ReadEnum(const wchar_t* section, const wchar_t* key, const wchar_t* const* words, int count,
+             int fallback)
+{
+    CheckFile();
+    if (!words || count <= 0)
+        return fallback;
+
+    wchar_t buf[64] = {};
+    GetPrivateProfileStringW(section, key, L"\x01", buf, 64, s_path);
+    if (buf[0] == L'\x01' || !buf[0])
+        return fallback;
+
+    // Trim, since "gpu " and "gpu" are the same intent and an ini file collects trailing
+    // spaces the moment anyone edits it by hand.
+    wchar_t* begin = buf;
+    while (*begin == L' ' || *begin == L'\t')
+        ++begin;
+    wchar_t* end = begin + wcslen(begin);
+    while (end > begin && (end[-1] == L' ' || end[-1] == L'\t'))
+        --end;
+    *end = 0;
+
+    for (int i = 0; i < count; ++i)
+        if (words[i] && _wcsicmp(begin, words[i]) == 0)
+            return i;
+
+    log::Write("config: [%ls] %ls=\"%ls\" is not one of the accepted values - using \"%ls\"",
+               section, key, begin,
+               (fallback >= 0 && fallback < count && words[fallback]) ? words[fallback] : L"?");
+    return fallback;
+}
+
 float ReadFloat(const wchar_t* section, const wchar_t* key, float fallback)
 {
     CheckFile();

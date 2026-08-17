@@ -20,6 +20,15 @@ int ReadInt(const wchar_t* section, const wchar_t* key, int fallback);
 bool ReadBool(const wchar_t* section, const wchar_t* key, bool fallback);
 float ReadFloat(const wchar_t* section, const wchar_t* key, float fallback);
 
+// One of a fixed set of words, matched without regard to case or surrounding spaces.
+//
+// `words` is a null-terminated array of the accepted spellings and `count` how many there are;
+// the return is the index of the one that matched, or `fallback` when the key is absent or
+// holds anything else. A setting whose values are names rather than numbers is otherwise read
+// as an integer somewhere, which turns a typo into a silent zero.
+int ReadEnum(const wchar_t* section, const wchar_t* key, const wchar_t* const* words, int count,
+             int fallback);
+
 float Clamp(float v, float lo, float hi);
 int ClampI(int v, int lo, int hi);
 

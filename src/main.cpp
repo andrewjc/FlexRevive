@@ -11,6 +11,7 @@
 #include "f4kit/Archive.h"
 #include "f4kit/CrashLog.h"
 #include "f4kit/EngineSetting.h"
+#include "gpu/GpuSolver.h"
 #include "DebrisSolver.h"
 #include "f4kit/Log.h"
 #include "f4kit/PeImage.h"
@@ -149,6 +150,19 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se)
     // tier in force and checks the container built later against it.
     if (config::Get().debrisQuality >= 0)
         solver::ExpectParticleBudget(config::Get().debrisQuality);
+
+    // Asking for the GPU brings the device up and reports what it found. Whether the step
+    // actually runs there is the backend's decision, not the setting's: it declines while any
+    // part of the work would still have to come back to the CPU mid-step, because the transfer
+    // costs more than the arithmetic it would save.
+    if (config::Get().computeBackend == config::Backend::kGpu) {
+        gpu::Start();
+        if (gpu::Ready())
+            log::Write("compute backend: gpu");
+        else
+            log::Write("compute backend: cpu. ComputeBackend=gpu was asked for but %s",
+                       gpu::NotReadyReason());
+    }
 
     log::Write("ready, weapon debris is simulated by this plugin");
     return true;

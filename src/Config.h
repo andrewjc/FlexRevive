@@ -5,6 +5,17 @@
 
 namespace flexrevive::config {
 
+// Which processor steps the debris.
+//
+// The CPU path is the reference and the default. The GPU path exists because the two costs
+// fall on different machines: the solver runs inside the call the game is already blocked in,
+// so on a machine with cores to spare the CPU is nearly free, while a machine with few cores
+// and a capable card has the opposite balance.
+enum class Backend {
+    kCpu = 0,
+    kGpu = 1,
+};
+
 // FlexRevive.ini, read from the folder containing the plugin DLL (Data\F4SE\Plugins).
 // Written back with full commentary when absent, so the file documents itself.
 struct Values {
@@ -80,6 +91,10 @@ struct Values {
     // the machine, 1 keeps everything on the calling thread. Read once when the pool starts,
     // so a change needs a restart.
     int solverThreads = 0;
+    // Which processor steps the debris. Asking for the GPU is a request, not a guarantee:
+    // the backend reports what it can actually do and the solver falls back to the CPU for
+    // anything it cannot, so this can never be the reason the physics is wrong.
+    Backend computeBackend = Backend::kCpu;
 };
 
 Values& Get();
