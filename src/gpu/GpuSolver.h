@@ -3,31 +3,51 @@
 
 #pragma once
 
+#include "gpu/Scene.h"
+
 #include <cstdint>
 
 // The GPU compute backend for the debris step.
 //
-// What is here and what is not
-// ----------------------------
-// This is the first half of the backend. It owns the device, the buffers and the dispatch, and
-// it runs the integration pass: gravity, air resistance, force fields and the speed cap. The
-// collision passes, which is where the time actually goes, are still the CPU's.
+// Why the whole loop, or none of it
+// ---------------------------------
+// The obvious design, moving one pass to the card and leaving the rest, does not work here. A
+// dispatch costs about a microsecond to submit; reading the results back costs about 0.6 ms on
+// a fast card, measured, because it is a pipeline stall rather than a transfer. So any split
+// that has to hand positions back to the CPU mid-substep pays that stall several times a frame
+// to save arithmetic measured in microseconds, and loses outright.
 //
-// That split is not yet worth enabling, and the backend says so rather than pretending
-// otherwise. Every substep would have to end with a readback to hand the positions to the CPU
-// collision passes, and a readback costs about 0.6 ms on a fast card against the 0.001 ms the
-// dispatch itself takes: the transfer is the whole cost, and paying it several times a frame
-// to save a few microseconds of arithmetic is a straight loss. Ready() therefore reports false
-// until the collision passes land and the loop can stay resident on the card, reading back
-// once a frame.
+// What works is keeping the state resident: upload once, run every substep as a chain of
+// dispatches with nothing read back between them, and read the transforms once at the end of
+// the frame. That is what this is arranged to do, and it is why the passes had to be ported
+// together rather than one at a time.
 //
-// So ComputeBackend=gpu currently initialises the device, reports what it found, and steps on
-// the CPU. It does not silently claim otherwise: that mistake has been made in this plugin
-// before, in a GpuSolver setting that chose a backend, logged it, and ran the same CPU code
-// either way.
+// World geometry is uploaded separately from the frame, because it changes rarely and is by
+// far the largest thing here: a cell's collision meshes run to tens of thousands of triangles,
+// against a few hundred pieces.
 namespace flexrevive::gpu {
 
-// One blast, as the integration pass reads it. Mirrors the ForceField the solver keeps.
+// One collision mesh, in its own local space, as the solver already holds it.
+struct MeshUpload {
+    const float* verts = nullptr;      // xyz triples
+    int vertCount = 0;
+    const int* indices = nullptr;      // 3 per triangle
+    int triCount = 0;
+    float lower[3] = {0, 0, 0};
+    float upper[3] = {0, 0, 0};
+
+    // The mesh's triangle index, when it has one. With gridStart null the shader falls back to
+    // testing every triangle, which is slower and equally correct.
+    const int* gridStart = nullptr;    // one entry per cell plus a terminator
+    int gridCellCount = 0;
+    const int* gridTris = nullptr;
+    int gridTriCount = 0;
+    int gridDim[3] = {0, 0, 0};
+    float gridOrigin[3] = {0, 0, 0};
+    float gridInvCell[3] = {1, 1, 1};
+};
+
+// One blast, as the integration reads it.
 struct Blast {
     float pos[3] = {0, 0, 0};
     float radius = 0.0f;
@@ -35,40 +55,66 @@ struct Blast {
     uint32_t linearFalloff = 0;
 };
 
-// Everything one integration substep needs that is not per-piece.
-struct StepParams {
-    float gravity[3] = {0, 0, 0};   // already scaled by GravityScale
-    float dt = 0.0f;
-    float dragBase = 0.0f;          // damping * DragScale / max(Heft, 0.05)
-    float maxSpeed = 0.0f;          // the engine's cap; 0 means none
+// Everything one frame needs. The piece arrays are the solver's own and are written back in
+// place; the rest is read only.
+struct Frame {
+    float* positions = nullptr;    // xyz per piece, updated in place
+    float* velocities = nullptr;   // xyz per piece, updated in place
+    float* rotations = nullptr;    // xyzw per piece, updated in place
+    float* angular = nullptr;      // xyz per piece, updated in place
+    const float* mass = nullptr;
+    const float* radii = nullptr;
+    uint8_t* resting = nullptr;    // updated in place
+    int count = 0;
+
+    const int* stepList = nullptr; // the moving subset
+    int stepCount = 0;
+
+    const Blast* blasts = nullptr;
+    int blastCount = 0;
+
+    // Tunables and per-step constants, filled by the caller so this stays free of the solver's
+    // configuration.
+    float gravity[3] = {0, 0, 0};  // already scaled
+    float dt = 0.0f;               // one substep
+    int substeps = 1;
+    float dragBase = 0.0f;
+    float maxSpeed = 0.0f;
+    float contactSkin = 0.0f;
+    float restitution = 0.0f;
+    float dynamicFriction = 0.0f;
+    float sleepSpeed = 0.0f;
+    float noBounceSpeed = 0.0f;
+    float rollBlend = 0.0f;
+    bool rolling = true;
 };
 
-// Brings up the device and the shaders. Returns whether the backend is usable at all, which is
-// weaker than Ready: a device may exist while the backend still declines to run the step.
-//
-// Safe to call more than once; only the first does the work.
 bool Start();
 
-// Whether the backend will actually step debris, as opposed to merely having a device. False
-// while the collision passes are still the CPU's, so the solver keeps its own path.
+// Whether the backend will actually step debris, as opposed to merely having a device.
 bool Ready();
 
 // Why Ready is false, for the log. Null when it is true.
 const char* NotReadyReason();
 
-// Runs one integration substep over `stepList` and writes the results back into `positions`
-// and `velocities`, which are the solver's own arrays, indexed by piece.
+// Uploads world geometry, replacing whatever was there. Call when the collision set changes,
+// not every frame: this is the expensive one.
 //
-// Returns false, having changed nothing, if the backend is unusable or the upload fails, so a
-// caller can fall through to the CPU path without checking anything first.
-//
-// `count` is the number of pieces, `stepList`/`stepCount` the moving subset, and `mass` one
-// entry per piece.
-bool IntegrateStep(float* positions, float* velocities, const float* mass, int count,
-                   const int* stepList, int stepCount, const Blast* blasts, int blastCount,
-                   const StepParams& params);
+// `colliders` is already in the shader's layout, since only the caller knows how to read the
+// engine's shape block. A collider referring to mesh k must set refs[0] to k.
+bool SetWorld(const scene::Collider* colliders, int colliderCount, const MeshUpload* meshes,
+              int meshCount, const float* planes, int planeCount);
 
-// Releases everything. For the tests; the plugin holds its device for the life of the process.
+// Runs `substeps` substeps and writes the results back into the frame's arrays. Returns false,
+// having changed nothing, when the backend is unusable or an upload fails, so a caller can fall
+// through to the CPU path without checking anything first.
+bool StepFrame(const Frame& f);
+
+// How long the last StepFrame spent, in milliseconds, split into the work and the readback.
+// The readback is the interesting half: it is the fixed cost the whole design is arranged
+// around, and the only way to know it on a given machine is to have measured it there.
+void LastTiming(double& outDispatchMs, double& outReadbackMs);
+
 void StopForTesting();
 
 }

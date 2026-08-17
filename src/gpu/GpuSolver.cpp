@@ -11,11 +11,12 @@
 #include <d3d11.h>
 
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <vector>
 
 #if FLEXREVIVE_HAVE_GPU
-#include "integrate_cs.h"
+#include "sweep_cs.h"
 #endif
 
 using namespace f4kit;
@@ -27,63 +28,26 @@ namespace {
 std::mutex s_mutex;
 bool s_tried = false;
 bool s_usable = false;
-const char* s_notReady = "the collision passes still run on the CPU, so a GPU step would "
-                         "cost a readback per substep to save less than it spends";
+const char* s_notReady = "the backend has not been started";
 
-ID3D11ComputeShader* s_integrate = nullptr;
+ID3D11ComputeShader* s_sweep = nullptr;
+ID3D11Buffer* s_params = nullptr;
 
-// Per-piece state as the shader sees it, and it has to be exactly as the shader sees it: the
-// stride is declared on the buffer and the shader indexes with it, so a struct that disagrees
-// reads every field of every piece from the wrong offset.
-//
-// Structured buffers pack tightly. That is the opposite of a constant buffer, where a vector
-// that would straddle a 16-byte register is pushed to the next one, and assuming the constant
-// buffer rule here is what made the first version of this read `vel` four bytes late. The
-// authority is `fxc /Fc`, which prints the offset of every member; the sizes asserted below
-// are copied from it rather than worked out by hand.
-//
-//   struct Piece { float3 pos;  // 0
-//                  float3 vel;  // 12
-//                  float mass;  // 24   } size 28
-struct GpuPiece {
-    float pos[3];
-    float vel[3];
-    float mass;
-};
-static_assert(sizeof(GpuPiece) == 28, "GpuPiece must match struct Piece in integrate.hlsl");
+double s_dispatchMs = 0.0;
+double s_readbackMs = 0.0;
 
-//   struct Blast { float3 pos;          // 0
-//                  float radius;        // 12
-//                  float strength;      // 16
-//                  uint linearFalloff;  // 20   } size 24
-struct GpuBlast {
-    float pos[3];
-    float radius;
-    float strength;
-    uint32_t linearFalloff;
-};
-static_assert(sizeof(GpuBlast) == 24, "GpuBlast must match struct Blast in integrate.hlsl");
+ID3D11Device* Dev() { return static_cast<ID3D11Device*>(device::Device()); }
+ID3D11DeviceContext* Ctx() { return static_cast<ID3D11DeviceContext*>(device::Context()); }
 
-// A constant buffer, by contrast, really is packed into 16-byte registers: gravity and dt
-// share the first one, which is why dt sits at 12 rather than 16.
-struct GpuParams {
-    float gravity[3];
-    float dt;
-    float dragBase;
-    float maxSpeed;
-    uint32_t stepCount;
-    uint32_t blastCount;
-};
-static_assert(sizeof(GpuParams) == 32, "GpuParams must match cbuffer Params in integrate.hlsl");
-static_assert(sizeof(GpuParams) % 16 == 0, "constant buffers are sized in 16-byte registers");
-
-// A structured buffer that grows to fit and is never shrunk, so a steady scene stops
+// A structured buffer with its views, grown to fit and never shrunk, so a steady scene stops
 // allocating after its first few frames.
 struct Buffer {
     ID3D11Buffer* buffer = nullptr;
     ID3D11ShaderResourceView* srv = nullptr;
     ID3D11UnorderedAccessView* uav = nullptr;
+    UINT stride = 0;
     UINT capacity = 0;
+    bool writable = false;
 
     void Release()
     {
@@ -94,30 +58,35 @@ struct Buffer {
     }
 };
 
-Buffer s_pieces;
-Buffer s_stepList;
-Buffer s_blasts;
-ID3D11Buffer* s_params = nullptr;
+// Piece state and the moving subset, replaced every frame.
+Buffer s_pieces, s_stepList, s_blasts;
+// World geometry, replaced only when it changes.
+Buffer s_colliders, s_meshes, s_verts, s_indices, s_gridStart, s_gridTris, s_planes;
 ID3D11Buffer* s_readback = nullptr;
-UINT s_readbackCapacity = 0;
+UINT s_readbackBytes = 0;
 
-std::vector<GpuPiece> s_upload;
-std::vector<GpuBlast> s_blastUpload;
-std::vector<uint32_t> s_stepUpload;
+std::vector<scene::Piece> s_pieceStage;
+std::vector<uint32_t> s_stepStage;
+std::vector<scene::Blast> s_blastStage;
 
-ID3D11Device* Dev() { return static_cast<ID3D11Device*>(device::Device()); }
-ID3D11DeviceContext* Ctx() { return static_cast<ID3D11DeviceContext*>(device::Context()); }
+// Flattened world geometry, kept so an upload does not have to be assembled twice.
+std::vector<scene::MeshDesc> s_meshStage;
+std::vector<float> s_vertStage;      // float4 per vertex, w unused
+std::vector<uint32_t> s_indexStage;
+std::vector<uint32_t> s_gridStartStage;
+std::vector<uint32_t> s_gridTriStage;
+// How many colliders were actually uploaded. A buffer is grown in powers of two
+// and its tail holds whatever was there before, so the shader must be told the
+// real count rather than the capacity.
+int s_colliderCountUploaded = 0;
+bool s_haveWorld = false;
 
-// A dynamic structured buffer, mapped with DISCARD each frame. Dynamic rather than default
-// because every one of these is written whole from the CPU every step, which is exactly the
-// case the discard path exists for.
 bool EnsureBuffer(Buffer& b, UINT stride, UINT count, bool writable)
 {
-    if (b.buffer && b.capacity >= count)
+    if (b.buffer && b.capacity >= count && b.stride == stride && b.writable == writable)
         return true;
     b.Release();
 
-    // Grown in powers of two, so a scene that creeps upward does not reallocate every frame.
     UINT capacity = 256;
     while (capacity < count)
         capacity *= 2;
@@ -152,42 +121,63 @@ bool EnsureBuffer(Buffer& b, UINT stride, UINT count, bool writable)
             return false;
         }
     }
+    b.stride = stride;
     b.capacity = capacity;
+    b.writable = writable;
     return true;
 }
 
-// The piece buffer is written by the shader, so it cannot be dynamic and is filled through a
-// staging upload instead.
-bool WriteDefaultBuffer(ID3D11Buffer* dst, const void* data, size_t bytes)
+// A dynamic buffer is written whole each time, which is what MAP_WRITE_DISCARD is for. A
+// default buffer is the shader's own output and is seeded through UpdateSubresource instead.
+bool Fill(Buffer& b, const void* data, size_t bytes)
 {
-    D3D11_BOX box{};
-    box.left = 0;
-    box.right = UINT(bytes);
-    box.bottom = 1;
-    box.back = 1;
-    Ctx()->UpdateSubresource(dst, 0, &box, data, 0, 0);
-    return true;
-}
-
-bool WriteDynamicBuffer(ID3D11Buffer* dst, const void* data, size_t bytes)
-{
+    if (!b.buffer)
+        return false;
+    if (!data || bytes == 0)
+        return true;   // nothing to copy is not a failure, and memcpy from null is a fault
+    if (b.writable) {
+        D3D11_BOX box{};
+        box.right = UINT(bytes);
+        box.bottom = 1;
+        box.back = 1;
+        Ctx()->UpdateSubresource(b.buffer, 0, &box, data, 0, 0);
+        return true;
+    }
     D3D11_MAPPED_SUBRESOURCE m{};
-    if (FAILED(Ctx()->Map(dst, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+    if (FAILED(Ctx()->Map(b.buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
         return false;
     memcpy(m.pData, data, bytes);
-    Ctx()->Unmap(dst, 0);
+    Ctx()->Unmap(b.buffer, 0);
     return true;
+}
+
+// Upload `data` into a freshly sized buffer, for the world geometry.
+//
+// An empty array still gets a buffer: a structured buffer cannot have zero elements, and the
+// shader stays bound to all of them whether or not it reads any. What it does not get is a
+// copy, because the source pointer for an empty vector is null and memcpy from null is a fault
+// rather than a no-op. A mesh with no triangle index and a scene with no hulls both take that
+// path, so it is the ordinary case rather than an edge one.
+bool Upload(Buffer& b, UINT stride, const void* data, size_t elements)
+{
+    if (!EnsureBuffer(b, stride, UINT(std::max<size_t>(elements, 1)), false))
+        return false;
+    if (!data || elements == 0)
+        return true;
+    return Fill(b, data, size_t(stride) * elements);
 }
 
 void ReleaseAll()
 {
-    s_pieces.Release();
-    s_stepList.Release();
-    s_blasts.Release();
+    for (Buffer* b : {&s_pieces, &s_stepList, &s_blasts, &s_colliders, &s_meshes, &s_verts,
+                      &s_indices, &s_gridStart, &s_gridTris, &s_planes})
+        b->Release();
     if (s_params) { s_params->Release(); s_params = nullptr; }
     if (s_readback) { s_readback->Release(); s_readback = nullptr; }
-    s_readbackCapacity = 0;
-    if (s_integrate) { s_integrate->Release(); s_integrate = nullptr; }
+    s_readbackBytes = 0;
+    if (s_sweep) { s_sweep->Release(); s_sweep = nullptr; }
+    s_haveWorld = false;
+    s_colliderCountUploaded = 0;
     s_usable = false;
 }
 
@@ -210,15 +200,14 @@ bool Start()
         return false;
     }
 
-    if (FAILED(Dev()->CreateComputeShader(g_integrateCS, sizeof(g_integrateCS), nullptr,
-                                          &s_integrate))) {
-        s_notReady = "the integration shader was rejected by the driver";
+    if (FAILED(Dev()->CreateComputeShader(g_sweepCS, sizeof(g_sweepCS), nullptr, &s_sweep))) {
+        s_notReady = "the world collision shader was rejected by the driver";
         log::Write("gpu: %s, staying on the CPU", s_notReady);
         return false;
     }
 
     D3D11_BUFFER_DESC cb{};
-    cb.ByteWidth = sizeof(GpuParams);
+    cb.ByteWidth = sizeof(scene::Params);
     cb.Usage = D3D11_USAGE_DYNAMIC;
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -230,6 +219,8 @@ bool Start()
     }
 
     s_usable = true;
+    s_notReady = "the piece-versus-piece, settle and particle passes are not yet dispatched, "
+                 "so a frame would still have to come back to the CPU part-way through";
     log::Write("gpu: compute backend initialised on %s", device::Info().description);
     return true;
 #endif
@@ -237,9 +228,9 @@ bool Start()
 
 bool Ready()
 {
-    // Deliberately not `s_usable`. The device works and the pass is correct, but the loop is
-    // not yet resident on the card, so running it would cost more than it saves. See the note
-    // at the top of GpuSolver.h.
+    // Deliberately not s_usable. The device works and the world pass runs, but the rest of the
+    // substep is still the CPU's, and a frame that has to return mid-way pays the readback it
+    // was arranged to avoid. See the note at the top of the header.
     return false;
 }
 
@@ -248,84 +239,200 @@ const char* NotReadyReason()
     return s_notReady;
 }
 
-bool IntegrateStep(float* positions, float* velocities, const float* mass, int count,
-                   const int* stepList, int stepCount, const Blast* blasts, int blastCount,
-                   const StepParams& params)
+bool SetWorld(const scene::Collider* colliders, int colliderCount, const MeshUpload* meshes,
+              int meshCount, const float* planes, int planeCount)
 {
 #if !FLEXREVIVE_HAVE_GPU
-    (void)positions; (void)velocities; (void)mass; (void)count;
-    (void)stepList; (void)stepCount; (void)blasts; (void)blastCount; (void)params;
+    (void)colliders; (void)colliderCount; (void)meshes; (void)meshCount;
+    (void)planes; (void)planeCount;
     return false;
 #else
     std::lock_guard<std::mutex> lock(s_mutex);
-    if (!s_usable || !positions || !velocities || !mass || count <= 0 || !stepList ||
-        stepCount <= 0)
+    if (!s_usable)
         return false;
 
-    s_upload.resize(size_t(count));
-    for (int i = 0; i < count; ++i) {
-        GpuPiece& g = s_upload[size_t(i)];
+    s_meshStage.clear();
+    s_vertStage.clear();
+    s_indexStage.clear();
+    s_gridStartStage.clear();
+    s_gridTriStage.clear();
+
+    // Every mesh is concatenated into one set of arrays, each descriptor recording where its
+    // own run begins. A shader cannot hold an array of buffers, and binding one per mesh would
+    // mean a dispatch per mesh.
+    for (int i = 0; i < meshCount; ++i) {
+        const MeshUpload& m = meshes[i];
+        scene::MeshDesc d{};
         for (int a = 0; a < 3; ++a) {
-            g.pos[a] = positions[size_t(i) * 3 + size_t(a)];
-            g.vel[a] = velocities[size_t(i) * 3 + size_t(a)];
+            d.lower[a] = m.lower[a];
+            d.upper[a] = m.upper[a];
+            d.gridOrigin[a] = m.gridOrigin[a];
+            d.gridInvCell[a] = m.gridInvCell[a];
+            d.gridDim[a] = uint32_t(std::max(m.gridDim[a], 0));
         }
-        g.mass = mass[size_t(i)];
+        d.offsets[0] = uint32_t(s_vertStage.size() / 4);
+        d.offsets[1] = uint32_t(s_indexStage.size());
+        d.offsets[2] = uint32_t(s_gridStartStage.size());
+        d.offsets[3] = uint32_t(s_gridTriStage.size());
+        d.counts[0] = uint32_t(std::max(m.vertCount, 0));
+        d.counts[1] = uint32_t(std::max(m.triCount, 0));
+
+        // The grid is usable only if it is entirely present. A partly uploaded index would send
+        // the sweep to cells that hold nothing and quietly stop finding surfaces.
+        const bool haveGrid = m.gridStart && m.gridTris && m.gridCellCount > 0 &&
+                              m.gridDim[0] > 0 && m.gridDim[1] > 0 && m.gridDim[2] > 0;
+        d.gridOrigin[3] = haveGrid ? 1.0f : 0.0f;
+        s_meshStage.push_back(d);
+
+        // Vertices widen to float4 so the buffer is indexed in whole 16-byte elements, which is
+        // the same discipline the structs follow and for the same reason.
+        for (int v = 0; v < m.vertCount; ++v) {
+            for (int a = 0; a < 3; ++a)
+                s_vertStage.push_back(m.verts ? m.verts[size_t(v) * 3 + size_t(a)] : 0.0f);
+            s_vertStage.push_back(0.0f);
+        }
+        for (int k = 0; k < m.triCount * 3; ++k)
+            s_indexStage.push_back(uint32_t(m.indices ? std::max(m.indices[k], 0) : 0));
+        if (haveGrid) {
+            for (int k = 0; k < m.gridCellCount; ++k)
+                s_gridStartStage.push_back(uint32_t(std::max(m.gridStart[k], 0)));
+            for (int k = 0; k < m.gridTriCount; ++k)
+                s_gridTriStage.push_back(uint32_t(std::max(m.gridTris[k], 0)));
+        }
     }
 
-    s_stepUpload.resize(size_t(stepCount));
-    for (int k = 0; k < stepCount; ++k)
-        s_stepUpload[size_t(k)] = uint32_t(stepList[k] >= 0 ? stepList[k] : 0);
+    const bool ok =
+        Upload(s_colliders, sizeof(scene::Collider), colliders,
+               size_t(std::max(colliderCount, 0))) &&
+        Upload(s_meshes, sizeof(scene::MeshDesc), s_meshStage.data(), s_meshStage.size()) &&
+        Upload(s_verts, 16, s_vertStage.data(), s_vertStage.size() / 4) &&
+        Upload(s_indices, 4, s_indexStage.data(), s_indexStage.size()) &&
+        Upload(s_gridStart, 4, s_gridStartStage.data(), s_gridStartStage.size()) &&
+        Upload(s_gridTris, 4, s_gridTriStage.data(), s_gridTriStage.size()) &&
+        Upload(s_planes, 16, planes, size_t(std::max(planeCount, 0)));
 
-    // At least one entry, since a zero-length structured buffer cannot be created and the
-    // shader reads none of it when the count is zero.
-    const int blastN = std::max(blastCount, 0);
-    s_blastUpload.resize(size_t(std::max(blastN, 1)));
+    s_colliderCountUploaded = ok ? std::max(colliderCount, 0) : 0;
+    s_haveWorld = ok;
+    if (!ok)
+        log::Write("gpu: world geometry could not be uploaded, staying on the CPU");
+    return ok;
+#endif
+}
+
+bool StepFrame(const Frame& f)
+{
+#if !FLEXREVIVE_HAVE_GPU
+    (void)f;
+    return false;
+#else
+    std::lock_guard<std::mutex> lock(s_mutex);
+    s_dispatchMs = s_readbackMs = 0.0;
+    if (!s_usable || !s_haveWorld || !f.positions || !f.velocities || !f.rotations ||
+        !f.angular || !f.mass || !f.radii || !f.resting || f.count <= 0 || !f.stepList ||
+        f.stepCount <= 0)
+        return false;
+
+    const auto start = std::chrono::steady_clock::now();
+
+    s_pieceStage.resize(size_t(f.count));
+    for (int i = 0; i < f.count; ++i) {
+        scene::Piece& g = s_pieceStage[size_t(i)];
+        for (int a = 0; a < 3; ++a) {
+            g.posRadius[a] = f.positions[size_t(i) * 3 + size_t(a)];
+            g.velMass[a] = f.velocities[size_t(i) * 3 + size_t(a)];
+            g.angGyr[a] = f.angular[size_t(i) * 3 + size_t(a)];
+        }
+        for (int a = 0; a < 4; ++a)
+            g.rot[a] = f.rotations[size_t(i) * 4 + size_t(a)];
+        g.posRadius[3] = f.radii[size_t(i)];
+        g.velMass[3] = f.mass[size_t(i)];
+        g.angGyr[3] = 0.0f;
+        g.state[0] = f.resting[size_t(i)] ? 1u : 0u;
+        g.state[1] = scene::kNoIndex;
+        g.state[2] = 0u;
+        g.state[3] = 0u;
+    }
+
+    s_stepStage.resize(size_t(f.stepCount));
+    for (int k = 0; k < f.stepCount; ++k) {
+        const int piece = f.stepList[k];
+        s_stepStage[size_t(k)] = uint32_t(piece >= 0 && piece < f.count ? piece : 0);
+        if (piece >= 0 && piece < f.count)
+            s_pieceStage[size_t(piece)].state[2] = 1u;   // stepping, for the pair pass
+    }
+
+    const int blastN = std::max(f.blastCount, 0);
+    s_blastStage.resize(size_t(std::max(blastN, 1)));
     for (int b = 0; b < blastN; ++b) {
-        GpuBlast& g = s_blastUpload[size_t(b)];
+        scene::Blast& g = s_blastStage[size_t(b)];
         for (int a = 0; a < 3; ++a)
-            g.pos[a] = blasts[b].pos[a];
-        g.radius = blasts[b].radius;
-        g.strength = blasts[b].strength;
-        g.linearFalloff = blasts[b].linearFalloff;
+            g.posRadius[a] = f.blasts[b].pos[a];
+        g.posRadius[3] = f.blasts[b].radius;
+        g.strength[0] = f.blasts[b].strength;
+        g.strength[1] = f.blasts[b].linearFalloff ? 1.0f : 0.0f;
+        g.strength[2] = g.strength[3] = 0.0f;
     }
 
-    if (!EnsureBuffer(s_pieces, sizeof(GpuPiece), UINT(count), true) ||
-        !EnsureBuffer(s_stepList, sizeof(uint32_t), UINT(stepCount), false) ||
-        !EnsureBuffer(s_blasts, sizeof(GpuBlast), UINT(s_blastUpload.size()), false))
+    if (!EnsureBuffer(s_pieces, sizeof(scene::Piece), UINT(f.count), true) ||
+        !EnsureBuffer(s_stepList, 4, UINT(f.stepCount), false) ||
+        !EnsureBuffer(s_blasts, sizeof(scene::Blast), UINT(s_blastStage.size()), false))
+        return false;
+    if (!Fill(s_pieces, s_pieceStage.data(), s_pieceStage.size() * sizeof(scene::Piece)) ||
+        !Fill(s_stepList, s_stepStage.data(), s_stepStage.size() * 4) ||
+        !Fill(s_blasts, s_blastStage.data(), s_blastStage.size() * sizeof(scene::Blast)))
         return false;
 
-    if (!WriteDefaultBuffer(s_pieces.buffer, s_upload.data(),
-                            s_upload.size() * sizeof(GpuPiece)) ||
-        !WriteDynamicBuffer(s_stepList.buffer, s_stepUpload.data(),
-                            s_stepUpload.size() * sizeof(uint32_t)) ||
-        !WriteDynamicBuffer(s_blasts.buffer, s_blastUpload.data(),
-                            s_blastUpload.size() * sizeof(GpuBlast)))
-        return false;
-
-    GpuParams gp{};
+    scene::Params p{};
     for (int a = 0; a < 3; ++a)
-        gp.gravity[a] = params.gravity[a];
-    gp.dt = params.dt;
-    gp.dragBase = params.dragBase;
-    gp.maxSpeed = params.maxSpeed;
-    gp.stepCount = uint32_t(stepCount);
-    gp.blastCount = uint32_t(blastN);
-    if (!WriteDynamicBuffer(s_params, &gp, sizeof(gp)))
-        return false;
+        p.gravityDt[a] = f.gravity[a];
+    p.gravityDt[3] = f.dt;
+    p.dragMaxSpeed[0] = f.dragBase;
+    p.dragMaxSpeed[1] = f.maxSpeed;
+    p.dragMaxSpeed[2] = f.contactSkin;
+    p.dragMaxSpeed[3] = f.restitution;
+    p.friction[0] = f.dynamicFriction;
+    p.sleep[0] = f.sleepSpeed;
+    p.sleep[1] = f.noBounceSpeed;
+    p.sleep[2] = f.rollBlend;
+    p.counts[0] = uint32_t(f.count);
+    p.counts[1] = uint32_t(f.stepCount);
+    p.counts[3] = uint32_t(blastN);
+    p.more[0] = uint32_t(s_meshStage.size());
+    p.more[1] = uint32_t(std::max(f.substeps, 1));
+    p.more[2] = f.rolling ? 1u : 0u;
+    p.counts[2] = uint32_t(std::max(0, s_colliderCountUploaded));
 
-    ID3D11ShaderResourceView* srvs[] = {s_stepList.srv, s_blasts.srv};
-    Ctx()->CSSetShader(s_integrate, nullptr, 0);
-    Ctx()->CSSetConstantBuffers(0, 1, &s_params);
-    Ctx()->CSSetShaderResources(0, 2, srvs);
-    Ctx()->CSSetUnorderedAccessViews(0, 1, &s_pieces.uav, nullptr);
-    Ctx()->Dispatch(UINT((stepCount + 63) / 64), 1, 1);
-
-    // Unbound before the readback, since a resource cannot be both a UAV and a copy source.
+    ID3D11ShaderResourceView* srvs[] = {
+        s_stepList.srv, s_blasts.srv, s_colliders.srv, s_meshes.srv,
+        s_verts.srv, s_indices.srv, s_gridStart.srv, s_gridTris.srv, s_planes.srv,
+    };
     ID3D11UnorderedAccessView* none = nullptr;
+
+    // Every substep is a dispatch, and nothing is read between them. That is the whole point:
+    // the state stays on the card for the frame and only the result comes back.
+    for (int s = 0; s < std::max(f.substeps, 1); ++s) {
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(Ctx()->Map(s_params, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            return false;
+        memcpy(m.pData, &p, sizeof(p));
+        Ctx()->Unmap(s_params, 0);
+
+        Ctx()->CSSetShader(s_sweep, nullptr, 0);
+        Ctx()->CSSetConstantBuffers(0, 1, &s_params);
+        Ctx()->CSSetShaderResources(0, UINT(sizeof(srvs) / sizeof(srvs[0])), srvs);
+        Ctx()->CSSetUnorderedAccessViews(0, 1, &s_pieces.uav, nullptr);
+        Ctx()->Dispatch(UINT((f.stepCount + 63) / 64), 1, 1);
+    }
     Ctx()->CSSetUnorderedAccessViews(0, 1, &none, nullptr);
 
-    const UINT bytes = UINT(s_upload.size() * sizeof(GpuPiece));
-    if (!s_readback || s_readbackCapacity < bytes) {
+    s_dispatchMs = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - start).count();
+
+    // The one readback, at the end of the frame. Timed separately because it is the fixed cost
+    // the whole design is arranged around.
+    const auto readStart = std::chrono::steady_clock::now();
+    const UINT bytes = UINT(s_pieceStage.size() * sizeof(scene::Piece));
+    if (!s_readback || s_readbackBytes < bytes) {
         if (s_readback)
             s_readback->Release();
         s_readback = nullptr;
@@ -335,7 +442,7 @@ bool IntegrateStep(float* positions, float* velocities, const float* mass, int c
         rd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(Dev()->CreateBuffer(&rd, nullptr, &s_readback)))
             return false;
-        s_readbackCapacity = bytes;
+        s_readbackBytes = bytes;
     }
 
     D3D11_BOX box{};
@@ -347,15 +454,29 @@ bool IntegrateStep(float* positions, float* velocities, const float* mass, int c
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(Ctx()->Map(s_readback, 0, D3D11_MAP_READ, 0, &m)))
         return false;
-    const auto* out = static_cast<const GpuPiece*>(m.pData);
-    for (int i = 0; i < count; ++i)
+    const auto* out = static_cast<const scene::Piece*>(m.pData);
+    for (int i = 0; i < f.count; ++i) {
         for (int a = 0; a < 3; ++a) {
-            positions[size_t(i) * 3 + size_t(a)] = out[i].pos[a];
-            velocities[size_t(i) * 3 + size_t(a)] = out[i].vel[a];
+            f.positions[size_t(i) * 3 + size_t(a)] = out[i].posRadius[a];
+            f.velocities[size_t(i) * 3 + size_t(a)] = out[i].velMass[a];
+            f.angular[size_t(i) * 3 + size_t(a)] = out[i].angGyr[a];
         }
+        for (int a = 0; a < 4; ++a)
+            f.rotations[size_t(i) * 4 + size_t(a)] = out[i].rot[a];
+        f.resting[size_t(i)] = out[i].state[0] ? 1 : 0;
+    }
     Ctx()->Unmap(s_readback, 0);
+
+    s_readbackMs = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - readStart).count();
     return true;
 #endif
+}
+
+void LastTiming(double& outDispatchMs, double& outReadbackMs)
+{
+    outDispatchMs = s_dispatchMs;
+    outReadbackMs = s_readbackMs;
 }
 
 void StopForTesting()

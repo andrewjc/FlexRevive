@@ -28,7 +28,7 @@ if(FXC_EXECUTABLE)
     file(MAKE_DIRECTORY ${SHADER_OUT})
     # Each name yields shaders/<name>.hlsl -> <name>_cs.h, declaring g_<name>CS. The generated
     # header is what declares the blob, so nothing has to restate its length by hand.
-    set(FLEXREVIVE_SHADERS integrate sweep pairs settle carry)
+    set(FLEXREVIVE_SHADERS sweep pairs settle carry)
     foreach(name ${FLEXREVIVE_SHADERS})
         add_custom_command(
             OUTPUT ${SHADER_OUT}/${name}_cs.h
@@ -149,8 +149,9 @@ if(FLEXREVIVE_TESTS)
     # The GPU suite talks to a real device, so it needs the shader headers and skips itself
     # cleanly on a machine that has no capable adapter.
     if(FXC_EXECUTABLE)
-        flexrevive_test(test_gpu src/gpu/Device.cpp src/gpu/GpuSolver.cpp src/Response.cpp
-                        ${FLEXREVIVE_SHADER_HEADERS})
+        flexrevive_test(test_gpu src/gpu/Device.cpp src/gpu/GpuSolver.cpp
+                        src/gpu/Scene.cpp src/Response.cpp src/Collision.cpp
+                        src/Math3D.cpp ${FLEXREVIVE_SHADER_HEADERS})
         target_include_directories(test_gpu PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/shaders)
         target_compile_definitions(test_gpu PRIVATE FLEXREVIVE_HAVE_GPU=1)
     endif()
