@@ -49,6 +49,11 @@ Enabled=1
 ; existing Fallout 4 setup has weapon debris turned off, because that was the only way to
 ; avoid the crash this plugin fixes. With this at 0 and debris disabled in your prefs, the
 ; plugin will load correctly and do nothing visible.
+;
+; Turning the setting on also mounts Fallout4 - Nvflex.ba2, which holds every debris mesh the
+; game owns. The engine mounts that archive during startup only if debris was already on, well
+; before any plugin loads, so with debris off it is skipped and each chunk resolves to a file
+; that is not there.
 ForceEnableWeaponDebris=1
 
 ; Take each chunk's spawn velocity, size and inertia from the engine rather than inferring

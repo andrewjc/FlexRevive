@@ -8,6 +8,7 @@
 // and no per-build offsets.
 
 #include "Config.h"
+#include "f4kit/Archive.h"
 #include "f4kit/CrashLog.h"
 #include "f4kit/EngineSetting.h"
 #include "DebrisSolver.h"
@@ -98,6 +99,7 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se)
         constexpr int kCount = int(sizeof(debrisSettings) / sizeof(debrisSettings[0]));
 
         engine::Resolve(debrisSettings, kCount);
+        bool masterSwitchWasOff = false;
         for (engine::Binding& b : debrisSettings) {
             bool before = false;
             if (!engine::GetBool(b, before)) {
@@ -108,13 +110,31 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se)
                 log::Write("%s already enabled", b.fullName);
                 continue;
             }
-            if (engine::SetBool(b, true))
+            if (engine::SetBool(b, true)) {
                 log::Write("%s was off, turned on (this is what makes debris appear; set "
                            "ForceEnableWeaponDebris=0 in FlexRevive.ini to opt out)",
                            b.fullName);
-            else
+                if (&b == &debrisSettings[0])
+                    masterSwitchWasOff = true;
+            } else {
                 log::Write("%s is off and could not be changed, weapon debris will not "
                            "spawn until you enable it yourself", b.fullName);
+            }
+        }
+
+        // Every debris mesh the game owns lives in Fallout4 - Nvflex.ba2, and that archive is
+        // in none of the lists in Fallout4.ini. The engine mounts it from code, once, behind a
+        // test of bNVFlexEnable that has already run by the time a plugin loads. Turning the
+        // setting on above is therefore too late for it: Flex runs, this solver runs, and every
+        // chunk the game asks for resolves to a file that is not there.
+        //
+        // So the archive is mounted here, exactly as the engine would have. Only when the
+        // setting was off, since the engine has already done it otherwise.
+        if (masterSwitchWasOff) {
+            if (!archive::Mount("Fallout4 - Nvflex.ba2"))
+                log::Write("weapon debris was off at startup, so the game skipped its debris "
+                           "archive and no chunk has a mesh. Set bNVFlexEnable=1 under [NVFlex] "
+                           "in Fallout4Prefs.ini and relaunch.");
         }
     }
 

@@ -14,6 +14,7 @@ add_library(FlexRevive SHARED
     src/Collision.cpp
     src/Config.cpp
     src/Contact.cpp
+    src/f4kit/Archive.cpp
     src/f4kit/CrashLog.cpp
     src/f4kit/EngineSetting.cpp
     src/Fragment.cpp

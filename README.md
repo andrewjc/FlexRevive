@@ -45,7 +45,8 @@ Then launch through `f4se_loader.exe`.
 ### You do not need to enable weapon debris yourself
 
 Almost every existing setup has weapon debris switched off, because that was the only way
-to avoid the crash. FlexRevive turns it back on for you at startup.
+to avoid the crash. FlexRevive turns it back on for you at startup, and mounts the archive
+the game skips when debris is off, so there is nothing to do and no restart to sit through.
 
 If you would rather manage it yourself, set `ForceEnableWeaponDebris=0` in the INI and
 enable it the normal way (`bNVFlexEnable=1` under `[NVFlex]` in `Fallout4Prefs.ini`, or the
@@ -62,6 +63,8 @@ exactly what the plugin did, in order:
 - `34 Flex entry points redirected` means the plugin is installed and in control.
 - `bNVFlexEnable:NVFlex was off, turned on` means debris was disabled and the plugin
   enabled it.
+- `archive: mounted "Fallout4 - Nvflex.ba2"` means the debris meshes are available. This
+  only appears when debris was off, since the game mounts the archive itself otherwise.
 - `advanced N rigid pieces` means debris is actually being simulated.
 
 If the log file does not exist at all, F4SE did not load the plugin. You probably launched

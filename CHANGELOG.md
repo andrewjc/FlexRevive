@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+* Fixed ForceEnableWeaponDebris appearing to do nothing, so the mod worked only for people who had already set bNVFlexEnable=1 themselves. Every debris mesh the game owns is in Fallout4 - Nvflex.ba2, which is in none of the archive lists in Fallout4.ini; the engine mounts it from code behind a test of bNVFlexEnable that has already run by the time F4SE loads a plugin. Turning the setting on was therefore too late for it, and the game ran with Flex enabled, the solver installed, and no mesh for any chunk to use
+* Added f4kit::archive::Mount, which mounts that archive itself when the setting had to be turned on. The routine is reached from the call site that names the archive rather than from an address, and is accepted only if the rest of the image calls it too, so no build-specific offset is involved
+
 ## 1.1.1
 
 * Fixed debris falling through terrain, because the world sweep found the surface and then nothing acted on the result
