@@ -76,6 +76,14 @@ struct Values {
     float settleRate = 1.5f;
     // How hard a burst of fresh debris shoves settled rubble nearby.
     float impactShock = 1.0f;
+    // Multiplies the strength of an explosion's force field.
+    //
+    // Not a taste setting so much as a correction. The engine publishes a blast as an
+    // acceleration, and for a frag grenade that acceleration arrives as 100 against a gravity
+    // of 686.6: a seventh of the pull holding the debris down, so the field wakes a pile and
+    // cannot lift any of it. Measured, not assumed. At 1.0 the engine's own figure is used
+    // unchanged, which is faithful and does nothing visible.
+    float blastScale = 6.0f;
     // How heavy the debris feels. Divides air resistance, bounce, and how far a chunk is
     // carried when something walks into it, on top of the per-piece mass from particle counts.
     float heft = 1.6f;

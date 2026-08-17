@@ -171,6 +171,24 @@ std::vector<ForceField> s_forceFields;
 // arrives and reaches nothing looks exactly like one that never arrived, and the two want
 // different fixes, so the count is reported rather than inferred.
 int s_blastWoke = 0;
+
+// Whether a point lies inside any live blast.
+//
+// Asked in two places that have to agree: whether a settled piece wakes, and whether a moving
+// one may be parked again. They did not agree, and the disagreement was invisible. A blast
+// woke thousands of pieces, each gained about twenty units per second from the field, and the
+// settle pass then saw a supported piece slower than the twenty-five it calls stationary,
+// zeroed its velocity and parked it. Every frame, for as long as the explosion lasted, so the
+// push could never accumulate into motion and a grenade did nothing at all.
+bool InsideAnyBlast(const float* pos)
+{
+    for (const ForceField& f : s_forceFields) {
+        const float d[3] = {pos[0] - f.pos[0], pos[1] - f.pos[1], pos[2] - f.pos[2]};
+        if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= f.radius * f.radius)
+            return true;
+    }
+    return false;
+}
 Pieces s_pieces;
 // Which slots the engine re-seeded on the current flexSetRigids call, so the position and
 // orientation passes agree on what is new.
@@ -813,6 +831,55 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
         s_impacts.clear();
     }
 
+    // Deliver blasts, once, before anything is integrated.
+    //
+    // The engine publishes an explosion's field for exactly one update, measured: "blast ended
+    // after 1 update(s)". So it is a single event, not a force sustained over time, and
+    // integrating it as an acceleration was wrong twice over. It gave a frag grenade a mean of
+    // 18.5 units/s against a sleep threshold of 25, which is why a grenade did nothing at all;
+    // and multiplying by the substep made the result depend on frame rate, so the same grenade
+    // would shove twice as hard at 30 fps as at 60.
+    //
+    // Applied here as a direct change in velocity, once per frame, exactly as an impact shock
+    // is and for the same reason. BlastScale sets how hard, and the engine's own strength
+    // still decides the relative force of one explosion against another.
+    if (!s_forceFields.empty() && g_tune.blastScale > 0.0f) {
+        for (int i = 0; i < s_pieces.count; ++i) {
+            float* pos = &s_pieces.translations[size_t(i) * 3];
+            if (!std::isfinite(pos[0]))
+                continue;
+
+            float push[3] = {0, 0, 0};
+            bool touched = false;
+            for (const ForceField& f : s_forceFields) {
+                const float d[3] = {pos[0] - f.pos[0], pos[1] - f.pos[1], pos[2] - f.pos[2]};
+                const float dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                if (dist2 > f.radius * f.radius || dist2 < 1e-6f)
+                    continue;
+                const float dist = std::sqrt(dist2);
+                const float falloff = f.linearFalloff ? (1.0f - dist / f.radius)
+                                                      : (1.0f - dist2 / (f.radius * f.radius));
+                const float mag = f.strength * g_tune.blastScale * falloff;
+                for (int a = 0; a < 3; ++a)
+                    push[a] += (d[a] / dist) * mag;
+                touched = true;
+            }
+            if (!touched)
+                continue;
+
+            // A blast carries momentum, so a heavy slab is shifted less than a splinter, the
+            // same law the impact shock uses.
+            const float m = (i < int(s_pieces.mass.size())) ? s_pieces.mass[size_t(i)] : 1.0f;
+            const float perMass = MassResponse(m);
+
+            float* vel = &s_pieces.velocities[size_t(i) * 3];
+            for (int a = 0; a < 3; ++a)
+                vel[a] += push[a] * perMass;
+            if (i < int(s_pieces.resting.size()))
+                s_pieces.resting[size_t(i)] = 0;
+        }
+    }
+
     // Each substep is a complete pass: integrate, sweep, resolve. Waking and settling are
     // re-evaluated each time, so a piece that stopped in one substep is not stepped again in
     // the next, and one shoved awake is.
@@ -906,18 +973,8 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
             // as gravity pulls it in and the contact pushes it back out.
             if (i < int(s_pieces.resting.size()) && s_pieces.resting[size_t(i)]) {
                 const float r = (i < int(s_pieces.radii.size())) ? s_pieces.radii[size_t(i)] : 0.0f;
-                bool blasted = false;
-                bool disturbed = false;
-
-                for (const ForceField& f : s_forceFields) {
-                    const float d[3] = {pos[0] - f.pos[0], pos[1] - f.pos[1], pos[2] - f.pos[2]};
-                    const float dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                    if (dist2 <= f.radius * f.radius) {
-                        blasted = true;
-                        break;
-                    }
-                }
-                disturbed = blasted;
+                const bool blasted = InsideAnyBlast(pos);
+                bool disturbed = blasted;
                 for (size_t k = 0; !disturbed && k < s_movers.size(); ++k) {
                     const Mover& m = s_movers[k];
                     const float d[3] = {pos[0] - m.pos[0], pos[1] - m.pos[1], pos[2] - m.pos[2]};
@@ -980,18 +1037,6 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
             for (int a = 0; a < 3; ++a)
                 vel[a] = (vel[a] + s->gravity[a] * g_tune.gravityScale * dt) * pieceDrag;
 
-            // Blasts push debris away from their centre, falling off with distance.
-            for (const ForceField& f : s_forceFields) {
-                float d[3] = {pos[0] - f.pos[0], pos[1] - f.pos[1], pos[2] - f.pos[2]};
-                const float dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                if (dist2 > f.radius * f.radius || dist2 < 1e-6f)
-                    continue;
-                const float dist = std::sqrt(dist2);
-                const float falloff = f.linearFalloff ? (1.0f - dist / f.radius)
-                                                      : (1.0f - dist2 / (f.radius * f.radius));
-                for (int a = 0; a < 3; ++a)
-                    vel[a] += (d[a] / dist) * f.strength * falloff * dt;
-            }
 
             // Honour the engine's speed cap where it published one.
             if (s->maxSpeed > 0.0f) {
@@ -1645,6 +1690,12 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
             for (int i = 0; i < s_pieces.count && i < int(s_supported.size()); ++i) {
                 if (!s_supported[size_t(i)] || s_pieces.resting[size_t(i)])
                     continue;
+                // A piece a blast is still pushing is not at rest, however slowly it happens to
+                // be moving this instant. Parking it here zeroes the velocity the field just
+                // gave it, and repeating that every frame is what made explosions inert.
+                if (!s_forceFields.empty() &&
+                    InsideAnyBlast(&s_pieces.translations[size_t(i) * 3]))
+                    continue;
                 float* vel = &s_pieces.velocities[size_t(i) * 3];
                 float* w = (i < int(s_pieces.angular.size()) / 3)
                                ? &s_pieces.angular[size_t(i) * 3] : nullptr;
@@ -1745,9 +1796,34 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
         const bool reached = s_blastWoke > 0;
         if (reached && !reachedLast && loggedBlast < 8) {
             ++loggedBlast;
+
+            // What the pieces inside the field are actually doing, rather than what the
+            // arithmetic suggests they should be. Two diagnoses of this have now been wrong
+            // because they reasoned from the numbers instead of reading them: the strength is
+            // published, the duration is counted, and the speed it produces is measured here.
+            float fastest = 0.0f;
+            double total = 0.0;
+            int inside = 0;
+            for (int i = 0; i < s_pieces.count; ++i) {
+                const float* p = &s_pieces.translations[size_t(i) * 3];
+                if (!std::isfinite(p[0]) || !InsideAnyBlast(p))
+                    continue;
+                const float* v = &s_pieces.velocities[size_t(i) * 3];
+                const float sp = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                fastest = std::max(fastest, sp);
+                total += double(sp);
+                ++inside;
+            }
+
             log::Write("blast: %zu force field(s), radius %.0f strength %.0f, disturbed %d "
-                       "settled piece(s)", s_forceFields.size(), s_forceFields[0].radius,
-                       s_forceFields[0].strength, s_blastWoke);
+                       "settled piece(s); %d inside, fastest %.1f units/s, mean %.1f "
+                       "(sleep threshold %.1f, gravity %.0f)",
+                       s_forceFields.size(), s_forceFields[0].radius,
+                       s_forceFields[0].strength, s_blastWoke, inside, double(fastest),
+                       inside ? total / double(inside) : 0.0, double(sleepSpeed),
+                       double(std::sqrt(s->gravity[0] * s->gravity[0] +
+                                        s->gravity[1] * s->gravity[1] +
+                                        s->gravity[2] * s->gravity[2])));
         }
         reachedLast = reached;
     }
@@ -3608,7 +3684,27 @@ void WINAPI Shim_flexExtSetForceFields(void* container, const void* fields, int 
 
     std::lock_guard<std::mutex> lock(s_solverMutex);
     s_forceFields.clear();
-    if (!fields || numFields <= 0 || numFields > 256)
+
+    // How long a blast lasts, counted in the calls the engine makes while it is alive.
+    //
+    // The impulse a field delivers is its strength times how long it is published for, so the
+    // duration decides whether a given strength means anything at all. It is stated nowhere,
+    // so it is counted. Before the early return below, not after: the engine publishes an
+    // empty list on almost every frame, and that is exactly the call that ends a blast.
+    static int aliveCalls = 0;
+    static int loggedLife = 0;
+    const bool haveAny = fields && numFields > 0 && numFields <= 256;
+    if (haveAny) {
+        ++aliveCalls;
+    } else if (aliveCalls > 0) {
+        if (loggedLife < 8) {
+            ++loggedLife;
+            log::Write("blast ended after %d update(s) with a field published", aliveCalls);
+        }
+        aliveCalls = 0;
+    }
+
+    if (!haveAny)
         return;
 
     auto base = static_cast<const uint8_t*>(fields);
@@ -3644,6 +3740,28 @@ void WINAPI Shim_flexExtSetForceFields(void* container, const void* fields, int 
                    "(%d of %d accepted)", f.pos[0], f.pos[1], f.pos[2], f.radius, f.strength,
                    f.linearFalloff ? "linear" : "quadratic", int(s_forceFields.size()),
                    numFields);
+
+        // Every field of the entry, as both a float and an integer, so which offset holds what
+        // is read off the game rather than inferred from its disassembly.
+        //
+        // The strength that arrives does not match the explosion record it came from: a frag
+        // grenade states a force of 2000 and a radius of 150, and what turns up here is a
+        // radius five times larger and a strength a twentieth the size. One of those is a
+        // scale the engine applies on purpose and the other is this code reading the wrong
+        // four bytes, and guessing which has already cost one wrong diagnosis.
+        char dump[512];
+        int n = 0;
+        auto entry = static_cast<const uint8_t*>(fields);
+        for (size_t off = 0; off + 4 <= kForceFieldSize && n < int(sizeof(dump)) - 48;
+             off += 4) {
+            float fv;
+            int32_t iv;
+            memcpy(&fv, entry + off, 4);
+            memcpy(&iv, entry + off, 4);
+            n += _snprintf_s(dump + n, sizeof(dump) - size_t(n), _TRUNCATE,
+                             "%s+%02zu=%g/%d", off ? " " : "", off, double(fv), iv);
+        }
+        log::Write("force field raw: %s", dump);
     }
     hadFields = !s_forceFields.empty();
 }

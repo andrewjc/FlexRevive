@@ -199,6 +199,22 @@ SettleRate=1.5
 ; 0 turns it off. Range 0.0 - 5.0.
 ImpactShock=1.0
 
+; How hard explosions throw debris that is already on the ground.
+;
+; The game publishes an explosion's blast to its debris solver for exactly one update, and
+; states a strength of 100 for a frag grenade. Treated as a force that number is meaningless:
+; over a single frame it changes a chunk's speed by about 18 units/s, against the 25 the solver
+; calls stationary, so a grenade landing in a pile of rubble did nothing whatsoever.
+;
+; So a blast is treated as what it is, a single kick, and this is how hard it kicks. A chunk at
+; the centre of a frag grenade leaves at BlastScale x 100 units/s, falling off to nothing at the
+; edge of the blast. Heavier chunks move less, as they do for everything else here.
+;
+; The game's own strength still decides one explosion against another, so a Molotov stays feeble
+; and a mini nuke does not. Raise this if you want blasts to clear a room, lower it if debris
+; sails too far, 0 turns explosions back into scenery. Range 0.0 - 100.0.
+BlastScale=6.0
+
 ; How heavy the debris feels.
 ;
 ; Each chunk already has its own mass, taken from the number of particles the game gave it, so
@@ -339,6 +355,7 @@ void Load()
         Clamp(ReadFloat(L"Collision", L"PieceRadiusScale", v.pieceRadiusScale), 0.1f, 5.0f);
     v.settleRate = Clamp(ReadFloat(L"Collision", L"SettleRate", v.settleRate), 0.0f, 5.0f);
     v.impactShock = Clamp(ReadFloat(L"Collision", L"ImpactShock", v.impactShock), 0.0f, 5.0f);
+    v.blastScale = Clamp(ReadFloat(L"Collision", L"BlastScale", v.blastScale), 0.0f, 100.0f);
     v.heft = Clamp(ReadFloat(L"Collision", L"Heft", v.heft), 0.25f, 4.0f);
 
     v.maxPieces = ClampI(ReadInt(L"Limits", L"MaxPieces", v.maxPieces), 64, 65536);
@@ -380,6 +397,7 @@ void Apply()
     t.pieceRadiusScale = v.pieceRadiusScale;
     t.settleRate = v.settleRate;
     t.impactShock = v.impactShock;
+    t.blastScale = v.blastScale;
     t.heft = v.heft;
     t.maxPieces = v.maxPieces;
     t.solverThreads = v.solverThreads;

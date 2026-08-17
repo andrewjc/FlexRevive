@@ -35,6 +35,7 @@ struct Tunables {
     float pieceRadiusScale = 1.0f;   // scales the shared collision radius every piece uses
     float settleRate = 1.5f;        // how fast a heap of rubble stops jostling itself
     float impactShock = 1.0f;        // how hard a fresh burst shoves the rubble around it
+    float blastScale = 6.0f;         // multiplies an explosion's published strength
     float heft = 1.6f;               // how heavy the debris feels: less drag, less bounce
     int maxPieces = 32768;           // ceiling on simultaneously simulated pieces
     // Threads the per-piece sweep runs across, counting the game thread. 0 sizes it from the
