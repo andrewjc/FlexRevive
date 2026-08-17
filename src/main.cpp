@@ -20,6 +20,30 @@
 
 #include "f4kit/F4SEPlugin.h"
 
+namespace {
+
+// Whether the debris archive still needs mounting, decided at load and acted on once the game
+// says its data handler is ready. See the note where it is set.
+bool s_mountDebrisArchive = false;
+
+// Runs when the game's own subsystems are up, rather than when this plugin loaded.
+void OnF4SEMessage(F4SEMessage* msg)
+{
+    using namespace flexrevive;
+    using namespace f4kit;
+
+    if (!msg || msg->type != kMessage_GameDataReady || !s_mountDebrisArchive)
+        return;
+    s_mountDebrisArchive = false;   // once, whatever the outcome
+
+    if (!archive::Mount("Fallout4 - Nvflex.ba2"))
+        log::Write("weapon debris was off at startup, so the game skipped its debris archive "
+                   "and no chunk has a mesh. Set bNVFlexEnable=1 under [NVFlex] in "
+                   "Fallout4Prefs.ini and relaunch.");
+}
+
+} // namespace
+
 extern "C" {
 
 __declspec(dllexport) F4SEPluginVersionData F4SEPlugin_Version = {
@@ -129,14 +153,10 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se)
         // setting on above is therefore too late for it: Flex runs, this solver runs, and every
         // chunk the game asks for resolves to a file that is not there.
         //
-        // So the archive is mounted here, exactly as the engine would have. Only when the
-        // setting was off, since the engine has already done it otherwise.
-        if (masterSwitchWasOff) {
-            if (!archive::Mount("Fallout4 - Nvflex.ba2"))
-                log::Write("weapon debris was off at startup, so the game skipped its debris "
-                           "archive and no chunk has a mesh. Set bNVFlexEnable=1 under [NVFlex] "
-                           "in Fallout4Prefs.ini and relaunch.");
-        }
+        // So the archive is mounted for it. Not here, though: a plugin is loaded before the
+        // game has built its data handler, and the mount routine reaches into it, so calling
+        // it at this point faults. It is deferred to kMessage_GameDataReady below.
+        s_mountDebrisArchive = masterSwitchWasOff;
     }
 
     // iQuality:NVFlex in Fallout4Prefs.ini selects one of three debris budgets:
@@ -162,6 +182,25 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se)
         else
             log::Write("compute backend: cpu. ComputeBackend=gpu was asked for but %s",
                        gpu::NotReadyReason());
+    }
+
+    // Anything needing an engine subsystem waits for the game to say so. Registration is
+    // optional: without it the plugin still replaces the solver, and only the archive mount is
+    // lost, which matters solely to someone who had weapon debris switched off.
+    if (s_mountDebrisArchive) {
+        auto* messaging = f4se
+            ? static_cast<F4SEMessagingInterface*>(f4se->QueryInterface(kInterface_Messaging))
+            : nullptr;
+        const uint32_t handle = f4se && f4se->GetPluginHandle ? f4se->GetPluginHandle() : 0;
+        if (messaging && messaging->RegisterListener &&
+            messaging->RegisterListener(handle, "F4SE", &OnF4SEMessage)) {
+            log::Write("waiting for the game's data handler before mounting the debris archive");
+        } else {
+            s_mountDebrisArchive = false;
+            log::Write("F4SE offers no messaging interface, so the debris archive cannot be "
+                       "mounted. Set bNVFlexEnable=1 under [NVFlex] in Fallout4Prefs.ini and "
+                       "relaunch.");
+        }
     }
 
     log::Write("ready, weapon debris is simulated by this plugin");

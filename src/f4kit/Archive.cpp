@@ -6,6 +6,10 @@
 #include "f4kit/Log.h"
 #include "f4kit/PeImage.h"
 
+// For the structured exception handling around the one call into engine code.
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -169,13 +173,30 @@ bool Mount(const char* archiveName)
     if (!site.fn)
         return false;
 
-    // The engine's own copy of the name is handed over rather than ours, so the routine
-    // receives exactly what the call site it was found from would have given it.
-    using MountFn = void(__fastcall*)(const char*, void*, void*);
-    reinterpret_cast<MountFn>(site.fn)(site.name, nullptr, nullptr);
+    // Guarded, because this is a call into a function identified by reading the game's own
+    // code rather than one this plugin was compiled against. The identification can be right
+    // and the call still be wrong: the routine reaches into engine state that has to have been
+    // built first, and calling it too early dereferences a global that is still null.
+    //
+    // Without the guard that fault propagates out of F4SEPlugin_Load, and F4SE responds by
+    // disabling the plugin for the whole session. So an optional extra costs the user weapon
+    // debris entirely, which is precisely backwards. A failure here has to cost only itself.
+    bool ok = false;
+    __try {
+        // The engine's own copy of the name is handed over rather than ours, so the routine
+        // receives exactly what the call site it was found from would have given it.
+        using MountFn = void(__fastcall*)(const char*, void*, void*);
+        reinterpret_cast<MountFn>(site.fn)(site.name, nullptr, nullptr);
+        ok = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        log::Write("archive: mounting \"%s\" faulted, so the archive is not available. "
+                   "Everything else is unaffected.", archiveName);
+        return false;
+    }
 
-    log::Write("archive: mounted \"%s\"", archiveName);
-    return true;
+    if (ok)
+        log::Write("archive: mounted \"%s\"", archiveName);
+    return ok;
 }
 
 }

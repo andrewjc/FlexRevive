@@ -53,6 +53,36 @@ struct F4SEInterface {
     const char* (*GetSaveFolderName)(void);
 };
 
+// F4SE's messaging interface, which is how a plugin arranges to run later than its own load.
+//
+// A plugin is loaded very early: F4SE reports "preinit complete" immediately before, and the
+// game has barely started building itself. Anything that depends on an engine subsystem being
+// constructed has to wait for one of these instead of doing it at load.
+constexpr uint32_t kInterface_Messaging = 1;
+
+struct F4SEMessage {
+    const char* sender;
+    uint32_t type;
+    uint32_t dataLen;
+    void* data;
+};
+
+// The subset used here. The values are F4SE's and must not be renumbered.
+enum {
+    kMessage_PostLoad = 0,       // every plugin has loaded
+    kMessage_PostPostLoad = 1,   // and every one of them has handled PostLoad
+    kMessage_GameDataReady = 10, // the game's data handler is up, archives included
+};
+
+struct F4SEMessagingInterface {
+    uint32_t interfaceVersion;
+    bool (*RegisterListener)(uint32_t listener, const char* sender,
+                             void (*handler)(F4SEMessage*));
+    bool (*Dispatch)(uint32_t sender, uint32_t type, void* data, uint32_t dataLen,
+                     const char* receiver);
+    void* (*GetEventDispatcher)(uint32_t dispatcherId);
+};
+
 // Filled in by F4SEPlugin_Query for F4SE 0.6.x loaders, which recognise a plugin solely by
 // that export. 0.7+ reads F4SEPlugin_Version and ignores Query; both are exported.
 struct PluginInfo {
