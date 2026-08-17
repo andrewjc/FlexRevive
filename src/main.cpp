@@ -8,7 +8,6 @@
 // and no per-build offsets.
 
 #include "Config.h"
-#include "f4kit/Archive.h"
 #include "f4kit/CrashLog.h"
 #include "f4kit/EngineSetting.h"
 #include "gpu/GpuSolver.h"
@@ -19,30 +18,6 @@
 #include <cstdint>
 
 #include "f4kit/F4SEPlugin.h"
-
-namespace {
-
-// Whether the debris archive still needs mounting, decided at load and acted on once the game
-// says its data handler is ready. See the note where it is set.
-bool s_mountDebrisArchive = false;
-
-// Runs when the game's own subsystems are up, rather than when this plugin loaded.
-void OnF4SEMessage(F4SEMessage* msg)
-{
-    using namespace flexrevive;
-    using namespace f4kit;
-
-    if (!msg || msg->type != kMessage_GameDataReady || !s_mountDebrisArchive)
-        return;
-    s_mountDebrisArchive = false;   // once, whatever the outcome
-
-    if (!archive::Mount("Fallout4 - Nvflex.ba2"))
-        log::Write("weapon debris was off at startup, so the game skipped its debris archive "
-                   "and no chunk has a mesh. Set bNVFlexEnable=1 under [NVFlex] in "
-                   "Fallout4Prefs.ini and relaunch.");
-}
-
-} // namespace
 
 extern "C" {
 
@@ -113,50 +88,50 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se)
         return true;
     }
 
-    // INI settings are parsed before F4SE loads plugins, so these objects already hold the
-    // user's values and writes to them take effect.
+    // Weapon debris, if the user has it switched off.
+    //
+    // Everything here turns on one fact: the game parses its ini files after F4SE has loaded
+    // its plugins, not before. So at this moment every Setting object still holds the value it
+    // was compiled with, and bNVFlexEnable reads as off whatever the user has configured.
+    //
+    // That is what made the old version of this useless. It read the Setting, always saw off,
+    // wrote on, and logged that it had enabled weapon debris; the ini parse then ran and put
+    // the user's value back. The log said the same thing in every session, and the setting had
+    // never been anything but decorative. It was measured rather than argued: in a session
+    // where the prefs enabled debris and all thirty-four Flex entry points ran, this code
+    // still reported the setting had been off and turned on.
+    //
+    // The prefs file is the only account of the user's intent that exists yet, so it is both
+    // what gets read and what gets written. Writing it costs one restart, once, which is the
+    // honest price of a decision the game makes before this plugin can speak.
     if (config::Get().forceEnableWeaponDebris) {
-        engine::Binding debrisSettings[] = {
-            {"bNVFlexEnable:NVFlex", nullptr, 0},
-            {"bNVFlexInstanceDebris:NVFlex", nullptr, 0},
-            {"bNVFlexDrawDebris:NVFlex", nullptr, 0},
-        };
-        constexpr int kCount = int(sizeof(debrisSettings) / sizeof(debrisSettings[0]));
-
-        engine::Resolve(debrisSettings, kCount);
-        bool masterSwitchWasOff = false;
-        for (engine::Binding& b : debrisSettings) {
-            bool before = false;
-            if (!engine::GetBool(b, before)) {
-                log::Write("could not locate %s, leaving it alone", b.fullName);
-                continue;
-            }
-            if (before) {
-                log::Write("%s already enabled", b.fullName);
-                continue;
-            }
-            if (engine::SetBool(b, true)) {
-                log::Write("%s was off, turned on (this is what makes debris appear; set "
-                           "ForceEnableWeaponDebris=0 in FlexRevive.ini to opt out)",
-                           b.fullName);
-                if (&b == &debrisSettings[0])
-                    masterSwitchWasOff = true;
-            } else {
-                log::Write("%s is off and could not be changed, weapon debris will not "
-                           "spawn until you enable it yourself", b.fullName);
-            }
+        const int enabled = engine::ReadGameIni(L"Fallout4", L"Fallout4Prefs.ini", L"NVFlex",
+                                                L"bNVFlexEnable", -1);
+        if (enabled == 1) {
+            log::Write("weapon debris is enabled in Fallout4Prefs.ini, so the game will build "
+                       "its debris system and this plugin will drive it");
+        } else if (enabled < 0) {
+            log::Write("Fallout4Prefs.ini has no bNVFlexEnable under [NVFlex] and could not be "
+                       "read, so weapon debris cannot be enabled for you. Add it, set it to 1, "
+                       "and restart.");
+        } else if (engine::WriteGameIni(L"Fallout4", L"Fallout4Prefs.ini", L"NVFlex",
+                                        L"bNVFlexEnable", 1)) {
+            log::Write("weapon debris was switched off, so the game will not build its debris "
+                       "system this run and nothing can spawn. It is now enabled for the next "
+                       "launch: RESTART THE GAME and debris will work. This is a one-off; set "
+                       "ForceEnableWeaponDebris=0 in FlexRevive.ini to manage it yourself.");
+        } else {
+            log::Write("weapon debris is switched off and could not be enabled for you. Set "
+                       "bNVFlexEnable=1 under [NVFlex] in Fallout4Prefs.ini and restart.");
         }
 
-        // Every debris mesh the game owns lives in Fallout4 - Nvflex.ba2, and that archive is
-        // in none of the lists in Fallout4.ini. The engine mounts it from code, once, behind a
-        // test of bNVFlexEnable that has already run by the time a plugin loads. Turning the
-        // setting on above is therefore too late for it: Flex runs, this solver runs, and every
-        // chunk the game asks for resolves to a file that is not there.
-        //
-        // So the archive is mounted for it. Not here, though: a plugin is loaded before the
-        // game has built its data handler, and the mount routine reaches into it, so calling
-        // it at this point faults. It is deferred to kMessage_GameDataReady below.
-        s_mountDebrisArchive = masterSwitchWasOff;
+        // The two rendering-side switches default to on, so they only need writing when the
+        // user has turned them off, and the same ini-parse ordering applies to them.
+        for (const wchar_t* key : {L"bNVFlexInstanceDebris", L"bNVFlexDrawDebris"}) {
+            if (engine::ReadGameIni(L"Fallout4", L"Fallout4Prefs.ini", L"NVFlex", key, 1) == 0 &&
+                engine::WriteGameIni(L"Fallout4", L"Fallout4Prefs.ini", L"NVFlex", key, 1))
+                log::Write("%ls was off in Fallout4Prefs.ini, enabled for the next launch", key);
+        }
     }
 
     // iQuality:NVFlex in Fallout4Prefs.ini selects one of three debris budgets:
@@ -182,25 +157,6 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se)
         else
             log::Write("compute backend: cpu. ComputeBackend=gpu was asked for but %s",
                        gpu::NotReadyReason());
-    }
-
-    // Anything needing an engine subsystem waits for the game to say so. Registration is
-    // optional: without it the plugin still replaces the solver, and only the archive mount is
-    // lost, which matters solely to someone who had weapon debris switched off.
-    if (s_mountDebrisArchive) {
-        auto* messaging = f4se
-            ? static_cast<F4SEMessagingInterface*>(f4se->QueryInterface(kInterface_Messaging))
-            : nullptr;
-        const uint32_t handle = f4se && f4se->GetPluginHandle ? f4se->GetPluginHandle() : 0;
-        if (messaging && messaging->RegisterListener &&
-            messaging->RegisterListener(handle, "F4SE", &OnF4SEMessage)) {
-            log::Write("waiting for the game's data handler before mounting the debris archive");
-        } else {
-            s_mountDebrisArchive = false;
-            log::Write("F4SE offers no messaging interface, so the debris archive cannot be "
-                       "mounted. Set bNVFlexEnable=1 under [NVFlex] in Fallout4Prefs.ini and "
-                       "relaunch.");
-        }
     }
 
     log::Write("ready, weapon debris is simulated by this plugin");

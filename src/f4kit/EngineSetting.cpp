@@ -7,7 +7,10 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <KnownFolders.h>
+#include <ShlObj.h>
 
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 #include <unordered_map>
@@ -100,6 +103,68 @@ int Resolve(Binding* bindings, int count)
                        ? "  <-- more than one, the first was taken" : "");
     log::Write("settings: resolved %d of %d engine settings", found, count);
     return found;
+}
+
+namespace {
+
+// Documents\My Games\<game>\<file>, or false when the Documents folder cannot be found.
+bool GameIniPath(const wchar_t* gameFolder, const wchar_t* fileName, wchar_t (&out)[MAX_PATH])
+{
+    PWSTR docs = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs)))
+        return false;
+    swprintf_s(out, L"%s\\My Games\\%s\\%s", docs, gameFolder, fileName);
+    CoTaskMemFree(docs);
+    return true;
+}
+
+} // namespace
+
+int ReadGameIni(const wchar_t* gameFolder, const wchar_t* fileName, const wchar_t* section,
+                const wchar_t* key, int fallback)
+{
+    wchar_t path[MAX_PATH] = {};
+    if (!gameFolder || !fileName || !section || !key ||
+        !GameIniPath(gameFolder, fileName, path))
+        return fallback;
+    return int(GetPrivateProfileIntW(section, key, fallback, path));
+}
+
+bool WriteGameIni(const wchar_t* gameFolder, const wchar_t* fileName, const wchar_t* section,
+                  const wchar_t* key, int value)
+{
+    wchar_t path[MAX_PATH] = {};
+    if (!gameFolder || !fileName || !section || !key ||
+        !GameIniPath(gameFolder, fileName, path))
+        return false;
+
+    // Only ever modify a file the game already keeps. Creating one would invent a settings
+    // file in a folder that may belong to a different install than the one running.
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        log::Write("settings: %ls does not exist, so %ls cannot be written", path, key);
+        return false;
+    }
+
+    wchar_t text[16] = {};
+    swprintf_s(text, L"%d", value);
+    if (!WritePrivateProfileStringW(section, key, text, path)) {
+        log::Write("settings: could not write [%ls] %ls=%d to %ls (error %lu). The file may be "
+                   "read-only, or owned by a mod manager.", section, key, value, path,
+                   GetLastError());
+        return false;
+    }
+
+    // Read back rather than trusting the write. A file redirected by a mod manager, or one the
+    // game has open, can accept the call and keep the old contents.
+    const int got = int(GetPrivateProfileIntW(section, key, ~value, path));
+    if (got != value) {
+        log::Write("settings: wrote [%ls] %ls=%d to %ls but it still reads %d", section, key,
+                   value, path, got);
+        return false;
+    }
+
+    log::Write("settings: wrote [%ls] %ls=%d to %ls", section, key, value, path);
+    return true;
 }
 
 bool GetBool(const Binding& b, bool& out)

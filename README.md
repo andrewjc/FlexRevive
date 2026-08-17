@@ -45,8 +45,13 @@ Then launch through `f4se_loader.exe`.
 ### You do not need to enable weapon debris yourself
 
 Almost every existing setup has weapon debris switched off, because that was the only way
-to avoid the crash. FlexRevive turns it back on for you at startup, and mounts the archive
-the game skips when debris is off, so there is nothing to do and no restart to sit through.
+to avoid the crash. FlexRevive turns it back on for you.
+
+It does cost one restart, and there is no way around that. The game reads the weapon debris
+setting once while it starts, well before it loads any plugin, and builds its debris system
+only if it was on. By the time FlexRevive can run, that decision has been made for the whole
+session. So the plugin enables the setting for next time and says so in the log; start the
+game again and debris works. Once only, not every launch.
 
 If you would rather manage it yourself, set `ForceEnableWeaponDebris=0` in the INI and
 enable it the normal way (`bNVFlexEnable=1` under `[NVFlex]` in `Fallout4Prefs.ini`, or the
@@ -61,10 +66,10 @@ If nothing happens, open `Documents\My Games\Fallout4\F4SE\FlexRevive.log`. It r
 exactly what the plugin did, in order:
 
 - `34 Flex entry points redirected` means the plugin is installed and in control.
-- `bNVFlexEnable:NVFlex was off, turned on` means debris was disabled and the plugin
-  enabled it.
-- `archive: mounted "Fallout4 - Nvflex.ba2"` means the debris meshes are available. This
-  only appears when debris was off, since the game mounts the archive itself otherwise.
+- `weapon debris is enabled` means the game built its debris system and the plugin has
+  something to drive.
+- `RESTART THE GAME` means debris was switched off, so nothing can spawn this session. The
+  plugin has enabled it for the next one. Start the game again.
 - `advanced N rigid pieces` means debris is actually being simulated.
 
 If the log file does not exist at all, F4SE did not load the plugin. You probably launched
@@ -99,7 +104,7 @@ restore defaults.
 [Rotation]    SpawnSpin, SpawnBurst, SpawnVelocityScale, ImpactTorque, Rolling
 [Collision]   DebrisVsDebris, PieceRadiusScale, SettleRate, ImpactShock, Heft
 [Limits]      MaxPieces
-[Performance] SolverThreads
+[Performance] SolverThreads, ComputeBackend
 ```
 
 ### How much debris you get

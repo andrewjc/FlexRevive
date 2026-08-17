@@ -32,6 +32,28 @@ struct Binding {
 // Resolves every binding in one pass over the image. Returns how many were found.
 int Resolve(Binding* bindings, int count);
 
+// Reads `key` under `section` from one of the game's own ini files, returning `fallback` when
+// the file or the key is absent.
+//
+// This, rather than the live Setting object, is what says how the game is configured while a
+// plugin is loading. F4SE loads plugins before the game has parsed its ini files, so at that
+// point every Setting still holds its compiled-in default: reading one says what the game was
+// built with, and writing one is undone by the parse that follows. The file is what the game
+// is about to read, and the only account of the user's intent that exists yet.
+int ReadGameIni(const wchar_t* gameFolder, const wchar_t* fileName, const wchar_t* section,
+                const wchar_t* key, int fallback);
+
+// Writes `key=value` under `section` in one of the game's own ini files, by name, under
+// Documents\My Games\<game>. Returns whether the file now holds that value.
+//
+// Some of the engine's settings are read once during startup and never consulted again, so
+// changing the live Setting object has no effect on anything that already ran. The only way to
+// alter those is to change what the game will read next time it starts.
+//
+// `gameFolder` is the folder under My Games, `fileName` the ini within it.
+bool WriteGameIni(const wchar_t* gameFolder, const wchar_t* fileName, const wchar_t* section,
+                  const wchar_t* key, int value);
+
 bool GetBool(const Binding& b, bool& out);
 bool SetBool(Binding& b, bool value);
 bool GetInt(const Binding& b, int32_t& out);
