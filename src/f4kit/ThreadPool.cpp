@@ -13,6 +13,16 @@
 
 namespace f4kit::threads {
 
+int AutoThreadCount(unsigned hardwareThreads)
+{
+    if (hardwareThreads < 2)
+        return 1;
+    // Two below six threads and up, one below that. The step is where holding back a second
+    // thread stops being cheap: at four it is a quarter of the machine.
+    const int total = int(hardwareThreads) - (hardwareThreads >= 6 ? 2 : 1);
+    return std::max(2, total);
+}
+
 namespace {
 
 struct Pool {
@@ -79,11 +89,7 @@ void Start(int totalThreads)
     std::call_once(s_once, [totalThreads] {
         const unsigned hw = std::thread::hardware_concurrency();
 
-        int total = totalThreads;
-        if (total <= 0) {
-            // Two cores of headroom for the game's own render and worker threads.
-            total = (hw > 3) ? int(hw) - 2 : 1;
-        }
+        int total = totalThreads > 0 ? totalThreads : AutoThreadCount(hw);
         total = std::max(1, std::min(total, 16));
 
         const int extra = total - 1;

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 // A spatial hash over piece positions, so piece-versus-piece costs a walk of each piece's own
@@ -18,11 +19,63 @@ namespace flexrevive::grid {
 // Power of two, so the hash reduces with a mask.
 constexpr int kBuckets = 8192;
 
+// Cells are coloured by their coordinates modulo three on each axis, which is what lets the
+// pieces in one colour be resolved at the same time.
+//
+// A piece reaches only into its own cell and the twenty-six around it, so resolving it touches
+// nothing outside that block of three. Two cells of the same colour differ by a multiple of
+// three on some axis, so their blocks do not overlap, so no two pieces of one colour can reach
+// the same third piece. Three is the smallest stride with that property, and twenty-seven the
+// smallest number of colours, because a stride of two puts a cell's block against its own
+// neighbour's.
+constexpr int kColours = 27;
+
 class PieceGrid {
 public:
     // Indexes `count` positions, three floats each. Slots holding anything that is not a finite
     // position are left out, since a retired slot can contain anything.
     void Build(const float* positions, int count, float cellSize);
+
+    // Which cell a piece was indexed into, or false when it was left out.
+    bool CellOfPiece(int piece, int* outCell) const
+    {
+        if (piece < 0 || size_t(piece) >= m_indexed.size() || !m_indexed[size_t(piece)])
+            return false;
+        for (int a = 0; a < 3; ++a)
+            outCell[a] = m_cells[size_t(piece) * 3 + size_t(a)];
+        return true;
+    }
+
+    // The colour of a piece's cell, or -1 when it was left out. In [0, kColours).
+    int ColourOfPiece(int piece) const
+    {
+        int cell[3];
+        if (!CellOfPiece(piece, cell))
+            return -1;
+        return ColourOfCell(cell);
+    }
+
+    static int ColourOfCell(const int* cell)
+    {
+        // Modulo that stays non-negative, since cells left of the origin have negative
+        // coordinates and the built-in operator would fold them onto negative colours.
+        auto m3 = [](int v) { return ((v % 3) + 3) % 3; };
+        return (m3(cell[0]) * 3 + m3(cell[1])) * 3 + m3(cell[2]);
+    }
+
+    // Whether two cells are the same or touching, which is the whole of what a piece can reach.
+    // The bucket walk offers pieces from unrelated cells that happen to share a hash bucket,
+    // and those are outside the block a colour reserves, so they have to be dropped before
+    // anything reads them.
+    static bool CellsAdjacent(const int* a, const int* b)
+    {
+        for (int i = 0; i < 3; ++i) {
+            const int d = a[i] - b[i];
+            if (d < -1 || d > 1)
+                return false;
+        }
+        return true;
+    }
 
     // Offers every piece that could be within reach of `self` at `p`, by index, and only ever
     // indices above `self` so each pair is offered once.
@@ -88,6 +141,11 @@ private:
 
     std::vector<int> m_head;
     std::vector<int> m_next;
+    // Each piece's cell, kept so a candidate can be tested for being genuinely nearby rather
+    // than merely sharing a hash bucket. Three ints per piece; only meaningful where
+    // m_indexed says the piece was indexed.
+    std::vector<int> m_cells;
+    std::vector<uint8_t> m_indexed;
     float m_invCell = 1.0f;
 };
 

@@ -220,9 +220,13 @@ MaxPieces=32768
 [Performance]
 ; How many threads sweep debris against the world, counting the game's own thread.
 ;
-;   0  size it from your CPU, leaving two threads' worth of headroom for the game
+;   0  size it from your CPU: all but two threads from six up, all but one below that
 ;   1  no extra threads; the solver runs entirely on the game thread
 ;   N  N threads in total, so N-1 extra
+;
+; So a quad core runs the solver on three and a six core on four. Less headroom is held back
+; on a small machine because it buys less there: this pool only runs inside the call the game
+; is already blocked in, so the threads it uses are not competing with rendering.
 ;
 ; The default is right for almost everyone. Raising it past the automatic value takes cores
 ; away from the game itself, which usually costs more frame time than it saves. Range 0 - 16.
@@ -230,6 +234,26 @@ MaxPieces=32768
 ; Unlike everything above, this is read once when the game starts, so changing it needs a
 ; restart rather than just a new cell.
 SolverThreads=0
+
+; Which processor steps the debris. cpu or gpu.
+;
+; The default is cpu and suits almost everyone. The solver runs inside a call the game is
+; already waiting on, so on a machine with spare cores the CPU work is close to free, while
+; the GPU is usually the part already struggling to draw the frame.
+;
+; gpu exists for the opposite machine: few cores, a capable card. Asking for it is a request
+; rather than an instruction. The plugin brings up a compute device of its own on whichever
+; card the game is using, reports what it found in the log, and steps on the GPU only for work
+; that is genuinely faster there. Anything else stays on the CPU, so this setting can never be
+; the reason the physics is wrong. Whatever it decides is written to the log at startup.
+;
+; As of this version the collision passes are still the CPU's, and moving only the rest would
+; mean copying every piece back from the card in the middle of each substep, which costs far
+; more than the arithmetic it saves. So gpu currently initialises the device, says so, and
+; steps on the CPU. It is not yet a performance setting.
+;
+; Needs a restart, like SolverThreads.
+ComputeBackend=cpu
 )INI";
 
 void ResolvePaths()
@@ -321,14 +345,21 @@ void Load()
 
     v.solverThreads = ClampI(ReadInt(L"Performance", L"SolverThreads", v.solverThreads), 0, 16);
 
+    {
+        static const wchar_t* const kBackends[] = {L"cpu", L"gpu"};
+        v.computeBackend = Backend(ReadEnum(L"Performance", L"ComputeBackend", kBackends, 2,
+                                            int(v.computeBackend)));
+    }
+
     log::SetVerbose(v.verboseLog);
     Apply();
 
     log::Write("config: gravity %.2f drag %.2f bounce %.2f grip %.2f spin %.1f burst %.0f torque %.2f "
-               "rolling %d d-vs-d %d radius %.2f max %d threads %d",
+               "rolling %d d-vs-d %d radius %.2f max %d threads %d backend %s",
                v.gravityScale, v.dragScale, v.restitutionScale, v.frictionScale, v.spawnSpin,
                v.spawnBurst, v.impactTorque, v.rolling ? 1 : 0, v.debrisVsDebris ? 1 : 0,
-               v.pieceRadiusScale, v.maxPieces, v.solverThreads);
+               v.pieceRadiusScale, v.maxPieces, v.solverThreads,
+               v.computeBackend == Backend::kGpu ? "gpu" : "cpu");
 }
 
 void Apply()

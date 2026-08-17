@@ -9,6 +9,44 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Visual C++ redistributable installed.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# Compute shaders are compiled to C headers at build time and embedded in the DLL.
+#
+# Nothing is compiled at runtime, so the plugin never needs d3dcompiler_47.dll on a user's
+# machine, and a shader that does not build breaks the build rather than the game. fxc ships
+# with the Windows SDK, which anyone building this already has; without it the GPU backend is
+# left out and the CPU path is the whole plugin.
+find_program(FXC_EXECUTABLE fxc
+    HINTS ${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}
+    PATHS "$ENV{WindowsSdkVerBinPath}x64" "$ENV{WindowsSdkDir}bin/x64"
+          "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64"
+          "C:/Program Files (x86)/Windows Kits/10/bin/10.0.19041.0/x64"
+    DOC "HLSL compiler from the Windows SDK")
+
+set(FLEXREVIVE_SHADER_HEADERS "")
+if(FXC_EXECUTABLE)
+    set(SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+    file(MAKE_DIRECTORY ${SHADER_OUT})
+    # Each name yields shaders/<name>.hlsl -> <name>_cs.h, declaring g_<name>CS. The generated
+    # header is what declares the blob, so nothing has to restate its length by hand.
+    set(FLEXREVIVE_SHADERS integrate)
+    foreach(name ${FLEXREVIVE_SHADERS})
+        add_custom_command(
+            OUTPUT ${SHADER_OUT}/${name}_cs.h
+            # /WX because a shader warning is a physics bug waiting to happen, and there are
+            # few enough of these that none of them may be noisy.
+            COMMAND ${FXC_EXECUTABLE} /nologo /T cs_5_0 /E main /O3 /WX
+                    /Fh ${SHADER_OUT}/${name}_cs.h /Vn g_${name}CS
+                    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${name}.hlsl
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${name}.hlsl
+            COMMENT "Compiling shaders/${name}.hlsl"
+            VERBATIM)
+        list(APPEND FLEXREVIVE_SHADER_HEADERS ${SHADER_OUT}/${name}_cs.h)
+    endforeach()
+else()
+    message(WARNING "fxc not found: building without the GPU backend, ComputeBackend=gpu "
+                    "will report it is unavailable and the CPU path will be used")
+endif()
+
 add_library(FlexRevive SHARED
     src/main.cpp
     src/Collision.cpp
@@ -31,7 +69,10 @@ add_library(FlexRevive SHARED
     src/Shock.cpp
     src/SlotTracker.cpp
     src/f4kit/ThreadPool.cpp
+    src/gpu/Device.cpp
+    src/gpu/GpuSolver.cpp
     src/version.rc
+    ${FLEXREVIVE_SHADER_HEADERS}
 )
 
 target_include_directories(FlexRevive PRIVATE src)
@@ -39,6 +80,13 @@ target_include_directories(FlexRevive PRIVATE src)
 # Windows.h defines min/max as macros, which breaks std::min/std::max in the solver.
 target_compile_definitions(FlexRevive PRIVATE NOMINMAX)
 
+if(FXC_EXECUTABLE)
+    target_include_directories(FlexRevive PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+    target_compile_definitions(FlexRevive PRIVATE FLEXREVIVE_HAVE_GPU=1)
+endif()
+
+# d3d11 and dxgi are loaded rather than linked, so the plugin still loads on a machine where
+# they are missing or broken; only the import libraries for the types are needed.
 target_link_libraries(FlexRevive PRIVATE shell32 ole32 dbghelp)
 
 set_target_properties(FlexRevive PROPERTIES
@@ -92,6 +140,16 @@ if(FLEXREVIVE_TESTS)
     flexrevive_test(test_slottracker src/SlotTracker.cpp src/Math3D.cpp)
     flexrevive_test(test_piecegrid src/PieceGrid.cpp)
     flexrevive_test(test_imports  src/f4kit/ImportHook.cpp)
+    flexrevive_test(test_threadpool src/f4kit/ThreadPool.cpp)
+
+    # The GPU suite talks to a real device, so it needs the shader headers and skips itself
+    # cleanly on a machine that has no capable adapter.
+    if(FXC_EXECUTABLE)
+        flexrevive_test(test_gpu src/gpu/Device.cpp src/gpu/GpuSolver.cpp src/Response.cpp
+                        ${FLEXREVIVE_SHADER_HEADERS})
+        target_include_directories(test_gpu PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+        target_compile_definitions(test_gpu PRIVATE FLEXREVIVE_HAVE_GPU=1)
+    endif()
     flexrevive_test(test_fragment src/Fragment.cpp)
     flexrevive_test(test_scene src/PairContact.cpp src/Response.cpp)
     flexrevive_test(test_terrain src/Collision.cpp src/Math3D.cpp)

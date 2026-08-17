@@ -22,6 +22,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cmath>
@@ -188,6 +189,15 @@ std::vector<uint8_t> s_wasResting;
 // by walking the pieces that are moving rather than the whole container.
 std::vector<int> s_pieceSlotStart;
 std::vector<int> s_pieceSlots;
+// Whether no two pieces name the same container slot, checked when the runs are rebuilt.
+//
+// Carrying the particles piece by piece writes each slot through whichever piece owns it, so
+// with the runs disjoint the pieces can be carried at once. Flex gives a particle to one rigid
+// body, so this is expected to hold, but a shared slot would turn concurrent carries into a
+// race rather than the harmless double write it is in order. Checked rather than assumed, and
+// the carry stays serial when it does not hold.
+bool s_slotsDisjoint = false;
+std::vector<uint8_t> s_slotSeen;
 
 // Each moving piece's position before it is stepped, so its particles can be carried by the
 // distance it actually travels.
@@ -227,6 +237,23 @@ int s_costPeak = 0;
 
 // Neighbourhoods for piece-versus-piece, rebuilt each step.
 grid::PieceGrid s_pieceGrid;
+
+// The pair pass grouped for threading, held here rather than in the step so the grouping is
+// allocation-free after the first few substeps.
+//
+// The unit of parallel work is a cell, not a piece. Colouring separates cells from each other,
+// but two pieces in one cell share their whole neighbourhood, so a cell's pieces have to stay
+// on one thread and in one order.
+//
+// s_pairOrder holds each moving piece as its cell followed by its step-list position, sorted,
+// so pieces of a cell are adjacent and their order does not depend on the scheduler.
+// s_cellRuns indexes the runs of equal cell within it, and s_colourBuckets groups those runs
+// by colour. s_uncoloured takes the pieces the grid left out, which have no cell and so no
+// bound on what they can reach.
+std::vector<std::array<int, 4>> s_pairOrder;
+std::vector<std::pair<int, int>> s_cellRuns;
+std::array<std::vector<int>, grid::kColours> s_colourBuckets;
+std::vector<int> s_uncoloured;
 
 // The pieces needing a step this frame, compacted so the settled majority never reaches the
 // parallel loop. Reused between frames to keep the step allocation-free.
@@ -1343,6 +1370,12 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
         // Below this the condition variable round trip costs more than the work it hands out,
         // so a light frame stays on the calling thread.
         constexpr int kMinPiecesForThreads = 48;
+        // Higher for the passes whose per-piece work is a few writes rather than a sweep
+        // through world geometry.
+        constexpr int kMinPiecesForParticleThreads = 256;
+        // Higher again for the pair pass, which pays for twenty-seven colour groups per
+        // substep before any of them does useful work.
+        constexpr int kMinPiecesForPairThreads = 384;
         if (stepCount >= kMinPiecesForThreads && threads::Workers() > 0) {
             const auto sweepStart = std::chrono::steady_clock::now();
             threads::ParallelFor(stepCount, 8, stepPiece);
@@ -1376,8 +1409,10 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
         }
     }
 
-        // Piece against piece is serial: unlike the sweep it writes both sides of every pair,
-        // so threads resolving overlapping pairs would fight over the same chunks.
+        // Piece against piece writes both sides of every pair, so unlike the sweep it cannot
+        // simply be handed to the pool: two threads resolving overlapping pairs would fight
+        // over the same chunks. It is run a colour at a time instead, which is what makes the
+        // pieces within one independent of each other. See kColours in PieceGrid.h.
         const auto pairStart = std::chrono::steady_clock::now();
         pairContacts = 0;
         if (g_tune.debrisVsDebris) {
@@ -1404,20 +1439,37 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
             // Each moving piece finds every neighbour, moving or not, so a pair is reached from
             // whichever side is moving. A pair of moving pieces would be reached from both, and
             // the lower index takes it.
-            for (int idx = 0; idx < stepCount; ++idx) {
+            std::atomic<int> pairHits{0};
+            std::atomic<int> wokePair{0};
+
+            // Everything one moving piece does to its neighbourhood. Within a colour these are
+            // independent: the block of cells this reads and writes belongs to `i` alone.
+            auto resolvePiece = [&](int idx) {
                 const int i = s_stepList[size_t(idx)];
                 if (i < 0 || i >= s_pieces.count)
-                    continue;
+                    return;
                 float* pi = &s_pieces.translations[size_t(i) * 3];
                 const float ri = (i < int(s_pieces.radii.size())) ? s_pieces.radii[size_t(i)]
                                                                   : s->radius;
                 if (!std::isfinite(pi[0]))
-                    continue;
+                    return;
+
+                int cellI[3];
+                const bool haveCellI = s_pieceGrid.CellOfPiece(i, cellI);
 
                 s_pieceGrid.ForEachCandidate(i, pi, [&](int j) {
                     const bool jStepping = j < int(s_stepping.size()) && s_stepping[size_t(j)];
                     if (jStepping && j < i)
                         return;   // the other side of this pair will take it
+
+                    // Buckets are shared between distant cells, so a candidate may be nowhere
+                    // near. Dropping those on the cell rather than on the distance is what
+                    // keeps a piece from reading a neighbour another colour's thread owns, and
+                    // it saves the distance test as well.
+                    int cellJ[3];
+                    if (haveCellI && s_pieceGrid.CellOfPiece(j, cellJ) &&
+                        !grid::PieceGrid::CellsAdjacent(cellI, cellJ))
+                        return;
 
                     float* pj = &s_pieces.translations[size_t(j) * 3];
                     const float rj = (j < int(s_pieces.radii.size()))
@@ -1484,7 +1536,7 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
                     pairs::Result pr;
                     if (!pairs::Resolve(ba, bb, sep, dist, s->gravity, ps, pr))
                         return;
-                    ++pairContacts;
+                    pairHits.fetch_add(1, std::memory_order_relaxed);
 
                     if (pr.supported == pairs::kSupportedA && i < int(s_supported.size()))
                         s_supported[size_t(i)] = 1;
@@ -1492,17 +1544,96 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
                         s_supported[size_t(j)] = 1;
 
                     if (s_traceWakes) {
+                        int woke = 0;
                         if (pr.wakeA && i < restCount && s_pieces.resting[size_t(i)])
-                            ++s_wokePair;
+                            ++woke;
                         if (pr.wakeB && j < restCount && s_pieces.resting[size_t(j)])
-                            ++s_wokePair;
+                            ++woke;
+                        if (woke)
+                            wokePair.fetch_add(woke, std::memory_order_relaxed);
                     }
                     if (pr.wakeA && i < restCount)
                         s_pieces.resting[size_t(i)] = 0;
                     if (pr.wakeB && j < restCount)
                         s_pieces.resting[size_t(j)] = 0;
                 });      // each neighbour offered by the grid
-            }            // each piece
+            };           // one piece's neighbourhood
+
+            // A cell at a time, cells of one colour at once, colours one after another.
+            //
+            // Two cells of a colour reach into blocks that do not overlap, so their pieces
+            // cannot meet and may run together. Two pieces of one cell share everything, so a
+            // cell stays on one thread. Running the colours in turn is what keeps each pair
+            // seeing the state the pairs before it left behind.
+            //
+            // A piece the grid left out has no cell and so no colour. Those go last, on one
+            // thread, since nothing bounds what they can reach.
+            const bool colourable = threads::Workers() > 0 &&
+                                    stepCount >= kMinPiecesForPairThreads;
+            if (!colourable) {
+                for (int idx = 0; idx < stepCount; ++idx)
+                    resolvePiece(idx);
+            } else {
+                s_pairOrder.clear();
+                s_uncoloured.clear();
+                for (int idx = 0; idx < stepCount; ++idx) {
+                    int cell[3];
+                    if (s_pieceGrid.CellOfPiece(s_stepList[size_t(idx)], cell))
+                        s_pairOrder.push_back(
+                            std::array<int, 4>{cell[0], cell[1], cell[2], idx});
+                    else
+                        s_uncoloured.push_back(idx);
+                }
+                // Sorted on the step-list position as well as the cell, so a cell's pieces are
+                // resolved in the same order every run and the result does not depend on how
+                // the work happened to be shared out.
+                std::sort(s_pairOrder.begin(), s_pairOrder.end());
+
+                s_cellRuns.clear();
+                for (auto& bucket : s_colourBuckets)
+                    bucket.clear();
+                for (size_t a = 0; a < s_pairOrder.size();) {
+                    size_t b = a + 1;
+                    while (b < s_pairOrder.size() &&
+                           s_pairOrder[b][0] == s_pairOrder[a][0] &&
+                           s_pairOrder[b][1] == s_pairOrder[a][1] &&
+                           s_pairOrder[b][2] == s_pairOrder[a][2])
+                        ++b;
+                    const int colour = grid::PieceGrid::ColourOfCell(s_pairOrder[a].data());
+                    s_colourBuckets[size_t(colour)].push_back(int(s_cellRuns.size()));
+                    s_cellRuns.emplace_back(int(a), int(b - a));
+                    a = b;
+                }
+
+                auto resolveRun = [&](int run) {
+                    const auto& r = s_cellRuns[size_t(run)];
+                    for (int k = 0; k < r.second; ++k)
+                        resolvePiece(s_pairOrder[size_t(r.first + k)][3]);
+                };
+
+                // Debris clusters, so most colours hold a handful of cells or none at all.
+                // Handing those to the pool costs more in round trips than the work is worth,
+                // and there are twenty-seven of them every substep.
+                const int inlineBelow = 2 * (threads::Workers() + 1);
+                for (const auto& bucket : s_colourBuckets) {
+                    const int cellsHere = int(bucket.size());
+                    if (cellsHere == 0)
+                        continue;
+                    if (cellsHere < inlineBelow) {
+                        for (int run : bucket)
+                            resolveRun(run);
+                    } else {
+                        threads::ParallelFor(cellsHere, 1,
+                                             [&](int k) { resolveRun(bucket[size_t(k)]); });
+                    }
+                }
+                for (int idx : s_uncoloured)
+                    resolvePiece(idx);
+            }
+
+            pairContacts += pairHits.load(std::memory_order_relaxed);
+            if (s_traceWakes)
+                s_wokePair += wokePair.load(std::memory_order_relaxed);
 
             pairMs += std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - pairStart).count();
@@ -1545,33 +1676,53 @@ void WINAPI Shim_flexUpdateSolver(void* handle, float frameDt, int substeps, voi
         // earlier leaves them holding a position and a velocity the piece no longer has.
         {
             const auto pStart = std::chrono::steady_clock::now();
+            std::atomic<int> carried{0};
+
+            // One piece's particles. Every slot it touches belongs to it alone once
+            // s_slotsDisjoint holds, so pieces are independent and may run at once.
+            auto carryPiece = [&](Container* c, int k) {
+                const int piece = s_stepList[size_t(k)];
+                if (piece < 0 || piece + 1 >= int(s_pieceSlotStart.size()) ||
+                    piece >= s_pieces.count)
+                    return;
+
+                const float* now = &s_pieces.translations[size_t(piece) * 3];
+                const float* was = &s_prePos[size_t(k) * 3];
+                const float delta[3] = {now[0] - was[0], now[1] - was[1], now[2] - was[2]};
+                const float* pieceVel = &s_pieces.velocities[size_t(piece) * 3];
+
+                int n = 0;
+                for (int e = s_pieceSlotStart[size_t(piece)];
+                     e < s_pieceSlotStart[size_t(piece) + 1]; ++e) {
+                    const int slot = s_pieceSlots[size_t(e)];
+                    if (slot < 0 || slot >= c->maxParticles)
+                        continue;
+                    float* pp = &c->particles[size_t(slot) * 4];
+                    if (!IsLiveParticle(pp))
+                        continue;
+                    CarryParticle(delta, pieceVel, pp, &c->velocities[size_t(slot) * 3]);
+                    ++n;
+                }
+                // Once per piece rather than once per particle, so the shared counter is not
+                // what the pass spends its time on.
+                if (n)
+                    carried.fetch_add(n, std::memory_order_relaxed);
+            };
+
+            // A piece owns a handful of particles, so the grain is larger than the sweep's:
+            // claiming work has to cost less than doing it.
+            const bool threaded = s_slotsDisjoint && threads::Workers() > 0 &&
+                                  stepCount >= kMinPiecesForParticleThreads;
             for (Container* c : s_containers) {
                 if (!c || c->maxParticles <= 0)
                     continue;
-                for (int k = 0; k < stepCount; ++k) {
-                    const int piece = s_stepList[size_t(k)];
-                    if (piece < 0 || piece + 1 >= int(s_pieceSlotStart.size()) ||
-                        piece >= s_pieces.count)
-                        continue;
-
-                    const float* now = &s_pieces.translations[size_t(piece) * 3];
-                    const float* was = &s_prePos[size_t(k) * 3];
-                    const float delta[3] = {now[0] - was[0], now[1] - was[1], now[2] - was[2]};
-                    const float* pieceVel = &s_pieces.velocities[size_t(piece) * 3];
-
-                    for (int e = s_pieceSlotStart[size_t(piece)];
-                         e < s_pieceSlotStart[size_t(piece) + 1]; ++e) {
-                        const int slot = s_pieceSlots[size_t(e)];
-                        if (slot < 0 || slot >= c->maxParticles)
-                            continue;
-                        float* pp = &c->particles[size_t(slot) * 4];
-                        if (!IsLiveParticle(pp))
-                            continue;
-                        CarryParticle(delta, pieceVel, pp, &c->velocities[size_t(slot) * 3]);
-                        ++moved;
-                    }
-                }
+                if (threaded)
+                    threads::ParallelFor(stepCount, 32, [&](int k) { carryPiece(c, k); });
+                else
+                    for (int k = 0; k < stepCount; ++k)
+                        carryPiece(c, k);
             }
+            moved += carried.load(std::memory_order_relaxed);
             particleMs += std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - pStart).count();
         }
@@ -2088,6 +2239,26 @@ void WINAPI Shim_flexSetRigids(void* handle, const int* offsets, const int* indi
             for (int slot : s_pieceSlots)
                 if (slot + 1 > high)
                     high = slot + 1;
+
+            // Same walk answers whether any slot is claimed twice, which is what decides
+            // whether the carry may run across threads.
+            s_slotSeen.assign(size_t(high), 0);
+            s_slotsDisjoint = true;
+            for (int slot : s_pieceSlots) {
+                if (slot < 0 || slot >= high)
+                    continue;
+                if (s_slotSeen[size_t(slot)]) {
+                    s_slotsDisjoint = false;
+                    break;
+                }
+                s_slotSeen[size_t(slot)] = 1;
+            }
+            static bool warned = false;
+            if (!s_slotsDisjoint && !warned) {
+                warned = true;
+                log::Write("two pieces claim the same particle slot, so particles are carried "
+                           "one piece at a time");
+            }
             for (Container* c : s_containers)
                 if (c && high > c->liveHigh)
                     c->liveHigh = std::min(high, c->maxParticles);

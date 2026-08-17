@@ -17,9 +17,21 @@
 // the loader lock.
 namespace f4kit::threads {
 
+// How many threads to run the solver on, counting the calling thread, given the machine's
+// hardware thread count. This is what SolverThreads=0 resolves to.
+//
+// Two threads' worth of headroom is left for the game, but only where two is a small share of
+// the machine. On a quad core that rule alone left the solver one worker while a six core got
+// three, and the headroom is worth less than it looks: the pool runs only inside
+// flexUpdateSolver, and the thread it is protecting the cores for is the one blocked in that
+// call waiting for the answer.
+//
+// Never returns less than 1, or less than 2 where the machine has more than one thread.
+int AutoThreadCount(unsigned hardwareThreads);
+
 // Starts the pool if it is not already running; later calls do nothing. `totalThreads` counts
 // the calling thread, so 1 means no workers and everything runs inline, and 0 means size it
-// from the machine.
+// with AutoThreadCount.
 void Start(int totalThreads);
 
 // Extra worker threads, not counting the caller. 0 when the pool is inert.

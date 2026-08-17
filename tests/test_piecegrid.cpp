@@ -9,6 +9,9 @@
 #include "TestHarness.h"
 
 #include <algorithm>
+#include <array>
+#include <iterator>
+#include <map>
 #include <cmath>
 #include <vector>
 
@@ -266,6 +269,169 @@ static void TestCandidatesAreSymmetric()
     CHECK_EQ(oneWay, 0);
 }
 
+// The pieces one moving piece reads and writes when it resolves its neighbourhood: itself,
+// plus every candidate the grid offers that survives the cell filter.
+static std::vector<int> Touches(const PieceGrid& g, const std::vector<float>& p, int i)
+{
+    std::vector<int> out{i};
+    int cellI[3];
+    const bool have = g.CellOfPiece(i, cellI);
+    g.ForEachCandidate(i, &p[size_t(i) * 3], [&](int j) {
+        int cellJ[3];
+        if (have && g.CellOfPiece(j, cellJ) && !PieceGrid::CellsAdjacent(cellI, cellJ))
+            return;
+        out.push_back(j);
+    });
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+static void TestColoursCoverEveryCell()
+{
+    test::Suite("every cell has exactly one colour, and every colour is used");
+
+    bool used[kColours] = {};
+    for (int x = -20; x <= 20; ++x)
+        for (int y = -20; y <= 20; ++y)
+            for (int z = -20; z <= 20; ++z) {
+                const int cell[3] = {x, y, z};
+                const int c = PieceGrid::ColourOfCell(cell);
+                CHECK(c >= 0 && c < kColours);
+                used[c] = true;
+            }
+
+    // Negative coordinates are the case a plain % gets wrong: it would fold cells left of the
+    // origin onto negative colours and index out of the bucket array.
+    for (int c = 0; c < kColours; ++c)
+        CHECK(used[c]);
+}
+
+static void TestSameColourCellsCannotShareANeighbour()
+{
+    test::Suite("same-coloured cells reach into blocks that do not overlap");
+
+    // The whole safety argument for resolving a colour across threads. A piece reaches into
+    // its own cell and the twenty-six around it, so two pieces may run at once only if those
+    // blocks are disjoint, and blocks are disjoint exactly when the cells differ by three or
+    // more on some axis.
+    std::vector<std::array<int, 3>> cells;
+    for (int x = -6; x <= 6; ++x)
+        for (int y = -6; y <= 6; ++y)
+            for (int z = -6; z <= 6; ++z)
+                cells.push_back({x, y, z});
+
+    int sameColourPairs = 0, overlapping = 0;
+    for (size_t a = 0; a < cells.size(); ++a)
+        for (size_t b = a + 1; b < cells.size(); ++b) {
+            if (PieceGrid::ColourOfCell(cells[a].data()) !=
+                PieceGrid::ColourOfCell(cells[b].data()))
+                continue;
+            ++sameColourPairs;
+            int spread = 0;
+            for (int k = 0; k < 3; ++k) {
+                const int d = cells[a][k] - cells[b][k];
+                spread = std::max(spread, d < 0 ? -d : d);
+            }
+            if (spread < 3)
+                ++overlapping;
+        }
+
+    CHECK(sameColourPairs > 10000);   // the fixture is exercising the case
+    CHECK_EQ(overlapping, 0);
+}
+
+static void TestOneColourNeverTouchesTheSamePieceTwice()
+{
+    test::Suite("no two cells of a colour touch the same piece");
+
+    // The same argument as above, but through the grid rather than the arithmetic, so it
+    // covers the bucket walk and the cell filter the solver actually runs.
+    //
+    // The unit here is a cell, which is the point. Colouring separates cells; it does nothing
+    // for two pieces sitting in one cell, whose neighbourhoods are identical. Grouping by
+    // piece instead of by cell fails this by tens of thousands of shared pieces, which is what
+    // it did before.
+    const int n = 900;
+    const float span = 300.0f;
+    const float cell = 40.0f;
+    const std::vector<float> p = Scatter(n, span);
+
+    PieceGrid g;
+    g.Build(p.data(), n, cell);
+
+    // Pieces grouped by cell, then cells grouped by colour, exactly as the solver groups them.
+    std::map<std::array<int, 3>, std::vector<int>> cells;
+    for (int i = 0; i < n; ++i) {
+        int c[3];
+        CHECK(g.CellOfPiece(i, c));   // every finite position is indexed
+        cells[{c[0], c[1], c[2]}].push_back(i);
+    }
+
+    std::vector<std::vector<std::vector<int>>> byColour(kColours);
+    for (const auto& entry : cells) {
+        // Everything one cell's worth of work reads and writes.
+        std::vector<int> touched;
+        for (int i : entry.second) {
+            const std::vector<int> t = Touches(g, p, i);
+            touched.insert(touched.end(), t.begin(), t.end());
+        }
+        std::sort(touched.begin(), touched.end());
+        touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+        byColour[size_t(PieceGrid::ColourOfCell(entry.first.data()))].push_back(touched);
+    }
+
+    int collisions = 0, compared = 0, populated = 0;
+    for (const auto& group : byColour) {
+        if (group.size() < 2)
+            continue;
+        ++populated;
+        for (size_t a = 0; a < group.size(); ++a)
+            for (size_t b = a + 1; b < group.size(); ++b) {
+                ++compared;
+                std::vector<int> shared;
+                std::set_intersection(group[a].begin(), group[a].end(), group[b].begin(),
+                                      group[b].end(), std::back_inserter(shared));
+                collisions += int(shared.size());
+            }
+    }
+
+    CHECK(populated > 20);   // the scatter really does spread across colours
+    CHECK(compared > 500);
+    CHECK_EQ(collisions, 0);
+}
+
+static void TestTheCellFilterDropsNoRealPair()
+{
+    test::Suite("the cell filter drops nothing within reach");
+
+    // Filtering candidates on the cell is what makes a colour safe, but it must not cost a
+    // collision. Cells are sized to the largest piece, so anything close enough to touch is in
+    // the same cell or one beside it, and the filter can only remove hash collisions.
+    const int n = 700;
+    const float span = 350.0f;
+    const float cell = 40.0f;
+    const std::vector<float> p = Scatter(n, span);
+
+    PieceGrid g;
+    g.Build(p.data(), n, cell);
+
+    int inReach = 0, dropped = 0;
+    for (int i = 0; i < n; ++i) {
+        const std::vector<int> kept = Touches(g, p, i);
+        for (int j = 0; j < n; ++j) {
+            if (j == i || Distance(p, i, j) > cell)
+                continue;
+            ++inReach;
+            if (!std::binary_search(kept.begin(), kept.end(), j))
+                ++dropped;
+        }
+    }
+
+    CHECK(inReach > 200);
+    CHECK_EQ(dropped, 0);
+}
+
 int main()
 {
     printf("PieceGrid\n");
@@ -278,5 +444,9 @@ int main()
     TestCandidatesBothWays();
     TestCandidateNeverSelf();
     TestCandidatesAreSymmetric();
+    TestColoursCoverEveryCell();
+    TestSameColourCellsCannotShareANeighbour();
+    TestOneColourNeverTouchesTheSamePieceTwice();
+    TestTheCellFilterDropsNoRealPair();
     return test::Report("PieceGrid");
 }

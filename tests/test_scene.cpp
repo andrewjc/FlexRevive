@@ -14,6 +14,7 @@
 #include "TestHarness.h"
 
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 using namespace flexrevive;

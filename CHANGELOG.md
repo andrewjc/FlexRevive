@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+* Changed piece-versus-piece to run across the pool, a cell at a time, by colouring cells on their coordinates modulo three. Two cells of one colour differ by three on some axis, so the blocks of twenty-seven they reach into do not overlap and their pieces cannot meet; colours still run one after another, so every pair sees what the pairs before it left behind. It was the last pass still serial, and the one that grows with the pile
+* Added a cell test to the candidate walk, so a piece never reads a neighbour that only shares a hash bucket. That was a data race waiting to happen once the pass ran on more than one thread, and it drops the distance test on those candidates as well
+* Added four tests covering the colouring, including that no two cells of a colour ever touch the same piece and that filtering on the cell drops nothing within reach. The first caught the design being wrong: colouring separates cells, and grouping the work by piece rather than by cell left two pieces sharing a cell running at once
+* Fixed PieceGrid.h and tests/test_scene.cpp using uint8_t and uint32_t without including cstdint, which only compiled because MSVC happened to have pulled it in already
+
 * Fixed ForceEnableWeaponDebris appearing to do nothing, so the mod worked only for people who had already set bNVFlexEnable=1 themselves. Every debris mesh the game owns is in Fallout4 - Nvflex.ba2, which is in none of the archive lists in Fallout4.ini; the engine mounts it from code behind a test of bNVFlexEnable that has already run by the time F4SE loads a plugin. Turning the setting on was therefore too late for it, and the game ran with Flex enabled, the solver installed, and no mesh for any chunk to use
 * Added f4kit::archive::Mount, which mounts that archive itself when the setting had to be turned on. The routine is reached from the call site that names the archive rather than from an address, and is accepted only if the rest of the image calls it too, so no build-specific offset is involved
 * Fixed a blast's falloff always being read as quadratic, because linearFalloff was taken from offset 24 of the force field entry, which is the mode field and is always zero. The flag is a byte at offset 40, and the engine writes it as 1
