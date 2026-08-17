@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
 
 * Added ComputeBackend=cpu|gpu under [Performance], defaulting to cpu. The two costs fall on different machines: the solver runs inside a call the game is already blocked in, so spare cores are nearly free, while the GPU is usually the part already struggling to draw the frame. gpu is for the opposite machine
 * Added src/gpu, a Direct3D 11 compute backend on a device of the plugin's own rather than the game's. Fallout 4's immediate context belongs to its render thread, so sharing it would mean synchronising against the renderer on every dispatch; a separate device on the same adapter cannot stall or corrupt the game's rendering. cs_5_0 covers NVIDIA from Fermi, AMD from GCN and Intel from Haswell through Arc, with no runtime for anyone to install

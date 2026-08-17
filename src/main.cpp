@@ -23,7 +23,7 @@ extern "C" {
 
 __declspec(dllexport) F4SEPluginVersionData F4SEPlugin_Version = {
     F4SEPluginVersionData::kVersion,
-    MAKE_EXE_VERSION(1, 1, 1), // plugin version 1.1.1
+    MAKE_EXE_VERSION(1, 2, 0), // plugin version 1.2.0
     "FlexRevive",
     "AndyR007",
     F4SEPluginVersionData::kAddressIndependence_Signatures,
@@ -52,7 +52,7 @@ __declspec(dllexport) bool F4SEPlugin_Query(const F4SEInterface* f4se, PluginInf
     if (info) {
         info->infoVersion = PluginInfo::kInfoVersion;
         info->name = "FlexRevive";
-        info->version = MAKE_EXE_VERSION(1, 1, 0);
+        info->version = MAKE_EXE_VERSION(1, 2, 0);
     }
     return f4se && !f4se->isEditor;
 }
@@ -64,7 +64,7 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se)
 
     log::Open(L"My Games\\Fallout4\\F4SE", L"FlexRevive.log");
     const uint32_t runtime = f4se ? f4se->runtimeVersion : 0;
-    log::Write("FlexRevive 1.1.1, runtime %u.%u.%u, F4SE %08X", (runtime >> 24) & 0xFF,
+    log::Write("FlexRevive 1.2.0, runtime %u.%u.%u, F4SE %08X", (runtime >> 24) & 0xFF,
                (runtime >> 16) & 0xFF, (runtime >> 4) & 0xFFF, f4se ? f4se->f4seVersion : 0);
 
     // Installed first, so a fault anywhere past this point reaches the log.
