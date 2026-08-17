@@ -28,7 +28,7 @@ if(FXC_EXECUTABLE)
     file(MAKE_DIRECTORY ${SHADER_OUT})
     # Each name yields shaders/<name>.hlsl -> <name>_cs.h, declaring g_<name>CS. The generated
     # header is what declares the blob, so nothing has to restate its length by hand.
-    set(FLEXREVIVE_SHADERS integrate)
+    set(FLEXREVIVE_SHADERS integrate sweep)
     foreach(name ${FLEXREVIVE_SHADERS})
         add_custom_command(
             OUTPUT ${SHADER_OUT}/${name}_cs.h
@@ -38,6 +38,7 @@ if(FXC_EXECUTABLE)
                     /Fh ${SHADER_OUT}/${name}_cs.h /Vn g_${name}CS
                     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${name}.hlsl
             DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${name}.hlsl
+                    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.hlsli
             COMMENT "Compiling shaders/${name}.hlsl"
             VERBATIM)
         list(APPEND FLEXREVIVE_SHADER_HEADERS ${SHADER_OUT}/${name}_cs.h)
