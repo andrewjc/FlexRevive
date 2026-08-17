@@ -17,6 +17,8 @@
 
 #if FLEXREVIVE_HAVE_GPU
 #include "sweep_cs.h"
+#include "pairs_cs.h"
+#include "settle_cs.h"
 #endif
 
 using namespace f4kit;
@@ -31,6 +33,8 @@ bool s_usable = false;
 const char* s_notReady = "the backend has not been started";
 
 ID3D11ComputeShader* s_sweep = nullptr;
+ID3D11ComputeShader* s_pairs = nullptr;
+ID3D11ComputeShader* s_settle = nullptr;
 ID3D11Buffer* s_params = nullptr;
 
 double s_dispatchMs = 0.0;
@@ -62,12 +66,19 @@ struct Buffer {
 Buffer s_pieces, s_stepList, s_blasts;
 // World geometry, replaced only when it changes.
 Buffer s_colliders, s_meshes, s_verts, s_indices, s_gridStart, s_gridTris, s_planes;
+// The pair pass's neighbourhood, rebuilt each frame from the piece positions.
+Buffer s_runs, s_cellPieces, s_gridHead, s_gridNext, s_pieceCell, s_supported;
 ID3D11Buffer* s_readback = nullptr;
 UINT s_readbackBytes = 0;
 
 std::vector<scene::Piece> s_pieceStage;
 std::vector<uint32_t> s_stepStage;
 std::vector<scene::Blast> s_blastStage;
+std::vector<uint32_t> s_headStage, s_nextStage, s_cellPieceStage, s_looseStage;
+std::vector<int32_t> s_cellStage;
+std::vector<scene::CellRun> s_runStage;
+std::vector<uint32_t> s_colourFirst, s_colourCount;
+std::vector<uint32_t> s_supportedStage;
 
 // Flattened world geometry, kept so an upload does not have to be assembled twice.
 std::vector<scene::MeshDesc> s_meshStage;
@@ -170,12 +181,14 @@ bool Upload(Buffer& b, UINT stride, const void* data, size_t elements)
 void ReleaseAll()
 {
     for (Buffer* b : {&s_pieces, &s_stepList, &s_blasts, &s_colliders, &s_meshes, &s_verts,
-                      &s_indices, &s_gridStart, &s_gridTris, &s_planes})
+                      &s_indices, &s_gridStart, &s_gridTris, &s_planes, &s_runs, &s_cellPieces,
+                      &s_gridHead, &s_gridNext, &s_pieceCell, &s_supported})
         b->Release();
     if (s_params) { s_params->Release(); s_params = nullptr; }
     if (s_readback) { s_readback->Release(); s_readback = nullptr; }
     s_readbackBytes = 0;
-    if (s_sweep) { s_sweep->Release(); s_sweep = nullptr; }
+    for (ID3D11ComputeShader** cs : {&s_sweep, &s_pairs, &s_settle})
+        if (*cs) { (*cs)->Release(); *cs = nullptr; }
     s_haveWorld = false;
     s_colliderCountUploaded = 0;
     s_usable = false;
@@ -200,10 +213,20 @@ bool Start()
         return false;
     }
 
-    if (FAILED(Dev()->CreateComputeShader(g_sweepCS, sizeof(g_sweepCS), nullptr, &s_sweep))) {
-        s_notReady = "the world collision shader was rejected by the driver";
-        log::Write("gpu: %s, staying on the CPU", s_notReady);
-        return false;
+    struct { const void* blob; size_t size; ID3D11ComputeShader** out; const char* name; }
+    kernels[] = {
+        {g_sweepCS, sizeof(g_sweepCS), &s_sweep, "world collision"},
+        {g_pairsCS, sizeof(g_pairsCS), &s_pairs, "piece against piece"},
+        {g_settleCS, sizeof(g_settleCS), &s_settle, "settle"},
+    };
+    for (const auto& k : kernels) {
+        if (FAILED(Dev()->CreateComputeShader(k.blob, k.size, nullptr, k.out))) {
+            s_notReady = "a compute shader was rejected by the driver";
+            log::Write("gpu: the %s shader was rejected by the driver, staying on the CPU",
+                       k.name);
+            ReleaseAll();
+            return false;
+        }
     }
 
     D3D11_BUFFER_DESC cb{};
@@ -391,9 +414,13 @@ bool StepFrame(const Frame& f)
     p.dragMaxSpeed[2] = f.contactSkin;
     p.dragMaxSpeed[3] = f.restitution;
     p.friction[0] = f.dynamicFriction;
+    p.friction[1] = f.pieceFriction;
+    p.friction[2] = f.settleRate;
+    p.friction[3] = f.heftBounce;
     p.sleep[0] = f.sleepSpeed;
     p.sleep[1] = f.noBounceSpeed;
     p.sleep[2] = f.rollBlend;
+    p.sleep[3] = f.spinDamp;
     p.counts[0] = uint32_t(f.count);
     p.counts[1] = uint32_t(f.stepCount);
     p.counts[3] = uint32_t(blastN);
@@ -402,28 +429,114 @@ bool StepFrame(const Frame& f)
     p.more[2] = f.rolling ? 1u : 0u;
     p.counts[2] = uint32_t(std::max(0, s_colliderCountUploaded));
 
-    ID3D11ShaderResourceView* srvs[] = {
+    // The pair pass's neighbourhood. Built from the positions at the start of the frame and
+    // held for all its substeps, where the CPU rebuilds it each one. Pieces move a fraction of
+    // a cell in a substep, so the same neighbours are offered either way; rebuilding it would
+    // mean a readback per substep, which is the cost this design exists to avoid.
+    const float cellSize = std::max(2.0f * f.widestPiece + f.contactSkin, 8.0f);
+    s_headStage.assign(size_t(scene::kBuckets), scene::kNoIndex);
+    s_nextStage.assign(size_t(f.count), scene::kNoIndex);
+    s_cellStage.assign(size_t(f.count) * 4, 0);
+    scene::BuildHash(f.positions, f.count, cellSize, s_headStage.data(), s_nextStage.data(),
+                     s_cellStage.data());
+    scene::BuildCellRuns(s_cellStage.data(), f.stepList, f.stepCount, s_cellPieceStage,
+                         s_runStage, s_colourFirst, s_colourCount, s_looseStage);
+
+    s_supportedStage.assign(size_t(f.count), 0u);
+
+    const bool pairs = f.debrisVsDebris && !s_runStage.empty();
+    if (pairs) {
+        if (!EnsureBuffer(s_runs, sizeof(scene::CellRun), UINT(s_runStage.size()), false) ||
+            !EnsureBuffer(s_cellPieces, 4, UINT(s_cellPieceStage.size()), false) ||
+            !EnsureBuffer(s_gridHead, 4, UINT(s_headStage.size()), false) ||
+            !EnsureBuffer(s_gridNext, 4, UINT(s_nextStage.size()), false) ||
+            !EnsureBuffer(s_pieceCell, 16, UINT(f.count), false) ||
+            !EnsureBuffer(s_supported, 4, UINT(f.count), true))
+            return false;
+        if (!Fill(s_runs, s_runStage.data(), s_runStage.size() * sizeof(scene::CellRun)) ||
+            !Fill(s_cellPieces, s_cellPieceStage.data(), s_cellPieceStage.size() * 4) ||
+            !Fill(s_gridHead, s_headStage.data(), s_headStage.size() * 4) ||
+            !Fill(s_gridNext, s_nextStage.data(), s_nextStage.size() * 4) ||
+            !Fill(s_pieceCell, s_cellStage.data(), s_cellStage.size() * 4))
+            return false;
+    }
+
+    ID3D11ShaderResourceView* sweepSrvs[] = {
         s_stepList.srv, s_blasts.srv, s_colliders.srv, s_meshes.srv,
         s_verts.srv, s_indices.srv, s_gridStart.srv, s_gridTris.srv, s_planes.srv,
     };
-    ID3D11UnorderedAccessView* none = nullptr;
+    ID3D11ShaderResourceView* pairSrvs[] = {
+        s_runs.srv, s_cellPieces.srv, s_gridHead.srv, s_gridNext.srv, s_pieceCell.srv,
+    };
+    ID3D11ShaderResourceView* settleSrvs[] = {s_supported.srv};
+    ID3D11ShaderResourceView* noSrvs[9] = {};
+    ID3D11UnorderedAccessView* noUavs[2] = {};
 
-    // Every substep is a dispatch, and nothing is read between them. That is the whole point:
-    // the state stays on the card for the frame and only the result comes back.
-    for (int s = 0; s < std::max(f.substeps, 1); ++s) {
+    auto setParams = [&]() {
         D3D11_MAPPED_SUBRESOURCE m{};
         if (FAILED(Ctx()->Map(s_params, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
             return false;
         memcpy(m.pData, &p, sizeof(p));
         Ctx()->Unmap(s_params, 0);
-
-        Ctx()->CSSetShader(s_sweep, nullptr, 0);
         Ctx()->CSSetConstantBuffers(0, 1, &s_params);
-        Ctx()->CSSetShaderResources(0, UINT(sizeof(srvs) / sizeof(srvs[0])), srvs);
+        return true;
+    };
+
+    // Every substep is a chain of dispatches with nothing read between them. That is the whole
+    // point: the state stays on the card for the frame and only the result comes back.
+    for (int s = 0; s < std::max(f.substeps, 1); ++s) {
+        // World collision, one thread per moving piece.
+        p.pass[0] = p.pass[1] = 0;
+        if (!setParams())
+            return false;
+        Ctx()->CSSetShader(s_sweep, nullptr, 0);
+        Ctx()->CSSetShaderResources(0, UINT(sizeof(sweepSrvs) / sizeof(sweepSrvs[0])),
+                                    sweepSrvs);
         Ctx()->CSSetUnorderedAccessViews(0, 1, &s_pieces.uav, nullptr);
         Ctx()->Dispatch(UINT((f.stepCount + 63) / 64), 1, 1);
+        Ctx()->CSSetUnorderedAccessViews(0, 2, noUavs, nullptr);
+        Ctx()->CSSetShaderResources(0, 9, noSrvs);
+
+        if (pairs) {
+            // Which pieces the pile holds up, rebuilt each substep: stale support would let a
+            // piece sleep with nothing under it.
+            const UINT zero[4] = {0, 0, 0, 0};
+            Ctx()->ClearUnorderedAccessViewUint(s_supported.uav, zero);
+
+            // One dispatch per colour, in turn. Two cells of a colour cannot reach the same
+            // piece, so a colour is safe to run at once; the colours are sequenced because each
+            // has to see what the one before it left behind.
+            ID3D11UnorderedAccessView* pairUavs[] = {s_pieces.uav, s_supported.uav};
+            Ctx()->CSSetShader(s_pairs, nullptr, 0);
+            Ctx()->CSSetShaderResources(0, UINT(sizeof(pairSrvs) / sizeof(pairSrvs[0])),
+                                        pairSrvs);
+            Ctx()->CSSetUnorderedAccessViews(0, 2, pairUavs, nullptr);
+            for (int c = 0; c < scene::kColours; ++c) {
+                const uint32_t runs = s_colourCount[size_t(c)];
+                if (runs == 0)
+                    continue;
+                p.pass[0] = runs;
+                p.pass[1] = s_colourFirst[size_t(c)];
+                if (!setParams())
+                    return false;
+                Ctx()->Dispatch(UINT((runs + 63) / 64), 1, 1);
+            }
+            Ctx()->CSSetUnorderedAccessViews(0, 2, noUavs, nullptr);
+            Ctx()->CSSetShaderResources(0, 9, noSrvs);
+
+            // A chunk the pile is holding up can now be parked. Every other sleep test lives
+            // inside a world contact, which a piece buried in a heap never reaches.
+            p.pass[0] = p.pass[1] = 0;
+            if (!setParams())
+                return false;
+            Ctx()->CSSetShader(s_settle, nullptr, 0);
+            Ctx()->CSSetShaderResources(0, 1, settleSrvs);
+            Ctx()->CSSetUnorderedAccessViews(0, 1, &s_pieces.uav, nullptr);
+            Ctx()->Dispatch(UINT((f.count + 63) / 64), 1, 1);
+            Ctx()->CSSetUnorderedAccessViews(0, 2, noUavs, nullptr);
+            Ctx()->CSSetShaderResources(0, 9, noSrvs);
+        }
     }
-    Ctx()->CSSetUnorderedAccessViews(0, 1, &none, nullptr);
 
     s_dispatchMs = std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - start).count();

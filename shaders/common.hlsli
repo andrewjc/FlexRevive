@@ -70,6 +70,9 @@ cbuffer Params : register(b0)
     float4 gSleep;          // x sleep speed, y static friction speed, z roll blend, w spin damp
     uint4 gCounts;          // x pieces, y step list length, z colliders, w blasts
     uint4 gMore;            // x mesh count, y substeps, z rolling, w spare
+    // Set per dispatch rather than per frame: the pair pass runs once for each
+    // colour, over a different span of the same run array each time.
+    uint4 gPass;            // x runs in this dispatch, y where they start, zw spare
 };
 
 #define gGravity      gGravityDt.xyz

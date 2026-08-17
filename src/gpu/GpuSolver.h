@@ -87,6 +87,15 @@ struct Frame {
     float noBounceSpeed = 0.0f;
     float rollBlend = 0.0f;
     bool rolling = true;
+    // Piece against piece, and the largest collision radius in the pool. The cell size follows
+    // the widest piece, so a chunk can only reach something in its own cell or one beside it,
+    // which is the property the colouring rests on.
+    bool debrisVsDebris = true;
+    float widestPiece = 0.0f;
+    float pieceFriction = 0.0f;
+    float settleRate = 1.0f;
+    float heftBounce = 1.0f;
+    float spinDamp = 36.0f;
 };
 
 bool Start();

@@ -19,7 +19,7 @@ RWStructuredBuffer<Piece> gPieces : register(u0);
 [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
-    if (tid.x >= gCounts.x)
+    if (tid.x >= gCounts.x)   // pieces
         return;
 
     const uint i = tid.x;

@@ -140,10 +140,12 @@ void ResolvePair(uint i, uint j, float3 sep, float dist, float extentI, float ex
 [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
-    if (tid.x >= gCounts.x)   // run count for this colour, passed in gCounts.x
+    // gPass.y is where this colour's runs begin and gPass.x how many there are. The runs are
+    // sorted by colour, so a colour is a contiguous span and needs no gather.
+    if (tid.x >= gPass.x)
         return;
 
-    const CellRun run = gRuns[tid.x];
+    const CellRun run = gRuns[gPass.y + tid.x];
 
     // Every piece of this cell, in the order the host laid them out, so the result does not
     // depend on how the work happened to be shared out.

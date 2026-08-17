@@ -95,7 +95,7 @@ void TestLayoutsMatchTheShaders()
     CHECK_EQ(int(sizeof(scene::MeshDesc)), 112);
     CHECK_EQ(int(sizeof(scene::Blast)), 32);
     CHECK_EQ(int(sizeof(scene::CellRun)), 16);
-    CHECK_EQ(int(sizeof(scene::Params)), 96);
+    CHECK_EQ(int(sizeof(scene::Params)), 112);
 
     // Every one is a whole number of 16-byte slots, which is what makes the two packing rules
     // agree. A struct that is not says the float4-only discipline has been broken somewhere.

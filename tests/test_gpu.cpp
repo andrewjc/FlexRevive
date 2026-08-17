@@ -133,6 +133,12 @@ gpu::Frame MakeFrame(Scene& s, const std::vector<gpu::Blast>& blasts, int subste
     f.noBounceSpeed = 45.0f;
     f.rollBlend = 0.35f;
     f.rolling = true;
+    f.debrisVsDebris = false;   // most cases isolate the world pass
+    f.widestPiece = 6.0f;
+    f.pieceFriction = 0.3f;
+    f.settleRate = 1.5f;
+    f.heftBounce = 1.0f;
+    f.spinDamp = 36.0f;
     return f;
 }
 
@@ -470,6 +476,119 @@ void TestBackendDeclinesUntilItIsWorthIt()
 
 } // namespace
 
+// Debris against debris, which is the pass that cannot simply be handed out per piece.
+//
+// The check here is not agreement with the CPU. The two schedule the same contacts in
+// different orders, and a pile is chaotic enough that any ordering difference diverges within
+// a few substeps whatever the arithmetic does. What has to hold is everything else: no piece
+// may be lost, flung, buried or left holding a value that is not a number, and running the
+// same scene twice must give the same answer. A data race between two threads sharing a chunk
+// would break the last of those, which is the failure the colouring exists to prevent.
+void TestPairsAreSaneAndRepeatable()
+{
+    test::Suite("piece against piece holds together");
+    if (!g_haveDevice)
+        return;
+
+    // A dense heap, so pieces genuinely overlap and the pair pass has work to do.
+    Scene a = MakeScene(1500, 4242u);
+    for (int i = 0; i < a.count; ++i) {
+        a.pos[size_t(i) * 3 + 0] *= 0.06f;   // squeezed into a few cells
+        a.pos[size_t(i) * 3 + 1] *= 0.06f;
+        a.pos[size_t(i) * 3 + 2] = 10.0f + Next() * 120.0f;
+    }
+    Scene b = a;
+
+    const std::vector<gpu::Blast> none;
+    gpu::Frame fa = MakeFrame(a, none, 8);
+    fa.debrisVsDebris = true;
+    const bool ran = gpu::StepFrame(fa);
+    CHECK(ran);
+    if (!ran)
+        return;
+
+    gpu::Frame fb = MakeFrame(b, none, 8);
+    fb.debrisVsDebris = true;
+    CHECK(gpu::StepFrame(fb));
+
+    // Repeatable. A race between two threads holding the same chunk would show up here as two
+    // runs of identical input disagreeing.
+    int differs = 0;
+    for (size_t i = 0; i < a.pos.size(); ++i)
+        if (a.pos[i] != b.pos[i])
+            ++differs;
+    printf("        components differing between two identical runs: %d\n", differs);
+    CHECK_EQ(differs, 0);
+
+    // Nothing lost, nothing flung, nothing underground.
+    int broken = 0, flung = 0, below = 0;
+    float fastest = 0.0f;
+    for (int i = 0; i < a.count; ++i) {
+        const float* q = &a.pos[size_t(i) * 3];
+        const float* v = &a.vel[size_t(i) * 3];
+        if (!std::isfinite(q[0]) || !std::isfinite(q[1]) || !std::isfinite(q[2]))
+            ++broken;
+        else if (q[2] < -50.0f)
+            ++below;
+        const float sp = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+        fastest = std::max(fastest, sp);
+        if (sp > 5000.0f)
+            ++flung;
+    }
+    printf("        %d pieces, fastest %.0f units/s, %d broken, %d flung, %d below ground\n",
+           a.count, double(fastest), broken, flung, below);
+    CHECK_EQ(broken, 0);
+    CHECK_EQ(flung, 0);
+    CHECK_EQ(below, 0);
+}
+
+// What a frame actually costs, against the figure the CPU path reports in the game.
+//
+// This is the question the whole backend turns on, and it is not answerable from the shape of
+// the code. The in-game cost line measured the CPU solver at 0.945 ms for 1002 pieces over two
+// substeps, on a sixteen-thread machine. The same scene is run here so the two numbers can be
+// put beside each other, rather than the backend being shipped on the assumption that a card
+// must be faster.
+void TestWhatAFrameCosts()
+{
+    test::Suite("what a frame costs");
+    if (!g_haveDevice)
+        return;
+
+    Scene s = MakeScene(1000, 8888u);
+    const std::vector<gpu::Blast> none;
+    gpu::Frame f = MakeFrame(s, none, 2);   // two substeps, as the game asks for
+    f.debrisVsDebris = true;
+
+    // Warm, so the first frame's allocations are not counted as the steady cost.
+    for (int i = 0; i < 5; ++i)
+        gpu::StepFrame(f);
+
+    const int kRuns = 30;
+    double dispatch = 0.0, readback = 0.0;
+    for (int i = 0; i < kRuns; ++i) {
+        CHECK(gpu::StepFrame(f));
+        double d = 0.0, r = 0.0;
+        gpu::LastTiming(d, r);
+        dispatch += d;
+        readback += r;
+    }
+    dispatch /= kRuns;
+    readback /= kRuns;
+
+    printf("        1000 pieces, 2 substeps: %.3f ms dispatch + %.3f ms readback = %.3f ms\n",
+           dispatch, readback, dispatch + readback);
+    printf("        the CPU path measured 0.945 ms for 1002 pieces over 2 substeps in game\n");
+    printf("        => the card is %s here\n",
+           (dispatch + readback) < 0.945 ? "faster" : "SLOWER");
+
+    // Not asserted against a threshold: it is a fact about this machine, and the machines this
+    // backend exists for have a weaker CPU and often a weaker card. What is asserted is that
+    // the figures were produced at all.
+    CHECK(dispatch >= 0.0);
+    CHECK(readback >= 0.0);
+}
+
 int main()
 {
     // Unbuffered, so a case that faults still shows which one it was. A driver fault takes
@@ -479,9 +598,11 @@ int main()
     TestDeviceComesUp();
     TestFreeFallMatchesTheCpu();
     TestSweepMatchesTheCpu();
+    TestPairsAreSaneAndRepeatable();
     TestBlastsMatchTheCpu();
     TestRetiredSlotsAreLeftAlone();
     TestTheReadbackIsMeasured();
+    TestWhatAFrameCosts();
     TestBackendDeclinesUntilItIsWorthIt();
     gpu::StopForTesting();
     return test::Report("Gpu");

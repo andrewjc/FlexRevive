@@ -3,6 +3,8 @@
 
 #include "gpu/Scene.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace flexrevive::gpu::scene {
@@ -64,6 +66,80 @@ void BuildHash(const float* positions, int count, float cellSize, uint32_t* outH
         const uint32_t bucket = BucketOf(cell[0], cell[1], cell[2]);
         outNext[i] = outHead[bucket];
         outHead[bucket] = uint32_t(i);
+    }
+}
+
+void BuildCellRuns(const int32_t* cells, const int* stepList, int stepCount,
+                   std::vector<uint32_t>& outPieces, std::vector<CellRun>& outRuns,
+                   std::vector<uint32_t>& outColourFirst, std::vector<uint32_t>& outColourCount,
+                   std::vector<uint32_t>& outLoose)
+{
+    outPieces.clear();
+    outRuns.clear();
+    outLoose.clear();
+    outColourFirst.assign(size_t(kColours), 0);
+    outColourCount.assign(size_t(kColours), 0);
+    if (!cells || !stepList || stepCount <= 0)
+        return;
+
+    // Sorted on colour, then cell, then step-list position. Sorting by colour first is what
+    // makes each colour a contiguous span of runs, so a colour is one dispatch rather than a
+    // gather; the rest is what makes the order deterministic.
+    struct Entry {
+        int colour;
+        int32_t cell[3];
+        uint32_t piece;
+        int order;
+    };
+    std::vector<Entry> sorted;
+    sorted.reserve(size_t(stepCount));
+
+    for (int k = 0; k < stepCount; ++k) {
+        const int piece = stepList[k];
+        if (piece < 0)
+            continue;
+        const int32_t* c = &cells[size_t(piece) * 4];
+        if (c[3] == 0) {
+            outLoose.push_back(uint32_t(piece));   // no cell, so nothing bounds its reach
+            continue;
+        }
+        Entry e;
+        e.colour = ColourOfCell(c);
+        for (int a = 0; a < 3; ++a)
+            e.cell[a] = c[a];
+        e.piece = uint32_t(piece);
+        e.order = k;
+        sorted.push_back(e);
+    }
+
+    std::sort(sorted.begin(), sorted.end(), [](const Entry& a, const Entry& b) {
+        if (a.colour != b.colour) return a.colour < b.colour;
+        for (int i = 0; i < 3; ++i)
+            if (a.cell[i] != b.cell[i]) return a.cell[i] < b.cell[i];
+        return a.order < b.order;
+    });
+
+    for (size_t a = 0; a < sorted.size();) {
+        size_t b = a + 1;
+        while (b < sorted.size() && sorted[b].colour == sorted[a].colour &&
+               sorted[b].cell[0] == sorted[a].cell[0] &&
+               sorted[b].cell[1] == sorted[a].cell[1] &&
+               sorted[b].cell[2] == sorted[a].cell[2])
+            ++b;
+
+        const int colour = sorted[a].colour;
+        if (outColourCount[size_t(colour)] == 0)
+            outColourFirst[size_t(colour)] = uint32_t(outRuns.size());
+
+        CellRun run{};
+        run.range[0] = uint32_t(outPieces.size());
+        run.range[1] = uint32_t(b - a);
+        outRuns.push_back(run);
+        ++outColourCount[size_t(colour)];
+
+        for (size_t k = a; k < b; ++k)
+            outPieces.push_back(sorted[k].piece);
+        a = b;
     }
 }
 

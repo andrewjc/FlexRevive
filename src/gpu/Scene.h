@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 // The solver's state, laid out the way the shaders read it.
 //
@@ -68,8 +69,9 @@ struct Params {
     float sleep[4];
     uint32_t counts[4];
     uint32_t more[4];
+    uint32_t pass[4];   // x runs in this dispatch, y where they start
 };
-static_assert(sizeof(Params) == 96, "must match cbuffer Params in common.hlsli");
+static_assert(sizeof(Params) == 112, "must match cbuffer Params in common.hlsli");
 static_assert(sizeof(Params) % 16 == 0, "constant buffers are sized in 16-byte registers");
 
 // Matches grid::kBuckets and grid::kColours.
@@ -89,5 +91,24 @@ void BuildHash(const float* positions, int count, float cellSize, uint32_t* outH
 // The colour of a cell, matching grid::PieceGrid::ColourOfCell. Non-negative for any cell,
 // including one left of the origin, where a plain modulo would fold onto a negative bucket.
 int ColourOfCell(const int32_t* cell);
+
+// Groups the moving pieces into the runs the pair pass dispatches.
+//
+// The unit of work is a cell, not a piece: colouring separates cells from each other, but two
+// pieces sitting in one cell share their whole neighbourhood, so a cell has to be resolved by
+// one thread in a fixed order. Getting that wrong on the CPU produced a different answer; on a
+// card it is two threads writing the same chunk.
+//
+// `outPieces` receives the piece indices grouped by cell, `outRuns` one entry per cell, and
+// `outColourFirst`/`outColourCount` index the runs of each colour, so a colour is dispatched
+// as a contiguous span. Pieces the grid left out have no cell and are returned in `outLoose`
+// for the caller to handle on its own, since nothing bounds what they can reach.
+//
+// Deterministic: runs are ordered by cell and pieces within a run by step-list position, so
+// the result does not depend on how the work was shared out.
+void BuildCellRuns(const int32_t* cells, const int* stepList, int stepCount,
+                   std::vector<uint32_t>& outPieces, std::vector<CellRun>& outRuns,
+                   std::vector<uint32_t>& outColourFirst, std::vector<uint32_t>& outColourCount,
+                   std::vector<uint32_t>& outLoose);
 
 }
