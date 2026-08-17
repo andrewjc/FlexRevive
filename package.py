@@ -29,8 +29,8 @@ SOURCE_FILES = [
     "README.md",
     "package.py",
 ]
-SOURCE_DIRS = ["src", "tests"]
-SOURCE_SUFFIXES = {".cpp", ".h", ".hpp", ".rc", ".txt"}
+SOURCE_DIRS = ["src", "tests", "shaders"]
+SOURCE_SUFFIXES = {".cpp", ".h", ".hpp", ".rc", ".txt", ".hlsl"}
 
 # What the mod archive contains, laid out as the game's Data folder so a mod manager
 # recognises it. Paths are relative to dist/.
@@ -41,6 +41,25 @@ BINARY_FILES = [
     "LICENSE.txt",
     "README.txt",
 ]
+
+# Everything in dist/ except the DLL is a copy of something else, so it is written here from
+# the original rather than kept alongside it.
+#
+# Keeping the copies was quietly costing accuracy: the shipped FlexRevive.ini had to be edited
+# in step with kDefaultIni in src/Config.cpp every time a setting changed, and the shipped
+# CHANGELOG.txt had drifted thirty-two lines behind CHANGELOG.md, so a release would have
+# carried a changelog missing its most recent entries. Generating them means they cannot be
+# out of date and there is nothing to remember.
+#
+# Each entry is the file in dist/ and where its content comes from.
+GENERATED = {
+    "CHANGELOG.txt": "CHANGELOG.md",
+    "LICENSE.txt": "LICENSE.txt",
+    "README.txt": "README.md",
+    # Not a file: the ini is a string literal in the source that writes it, which is what makes
+    # it the authority. See ini_from_source.
+    "F4SE/Plugins/FlexRevive.ini": None,
+}
 
 # Nothing under these may ever be packaged, whatever the lists above say. tools/ holds
 # debugger scripts that attach to a running game, which is exactly the shape of thing a
@@ -102,12 +121,40 @@ def source_members():
     return out
 
 
+def ini_from_source():
+    """The default FlexRevive.ini, taken from the literal in src/Config.cpp that writes it.
+
+    The plugin writes this file itself when it is absent, so the copy in the source is the one
+    users actually end up with and any other copy is a transcription of it.
+    """
+    text = (ROOT / "src" / "Config.cpp").read_text(encoding="utf-8")
+    m = re.search(r'kDefaultIni = R"INI\((.*?)\)INI"', text, re.S)
+    if not m:
+        sys.exit("could not find kDefaultIni in src/Config.cpp, so the shipped ini cannot "
+                 "be generated")
+    return m.group(1)
+
+
+def write_generated():
+    """Refreshes the derived files in dist/, leaving the built DLL alone."""
+    for name, source in GENERATED.items():
+        body = ini_from_source() if source is None else \
+            (ROOT / source).read_text(encoding="utf-8")
+        out = ROOT / "dist" / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # CRLF, because these are opened in Notepad on a Windows machine as often as not.
+        out.write_text(body, encoding="utf-8", newline="\r\n")
+
+
 def binary_members():
+    write_generated()
     out = []
     for name in BINARY_FILES:
         path = ROOT / "dist" / name
         if not path.is_file():
-            sys.exit(f"missing from dist/: {name}. Build the Release configuration first.")
+            hint = ("Build the Release configuration first."
+                    if name.endswith(".dll") else "It should have been generated.")
+            sys.exit(f"missing from dist/: {name}. {hint}")
         out.append((path, name))
     return out
 

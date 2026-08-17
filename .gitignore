@@ -1,15 +1,13 @@
 # Build output
 build/
 build-analyze/
+build-msvc/
 out/
 *.pdb
 *.obj
 *.ilk
 *.exp
 *.lib
-
-# The staged plugin binary; the rest of dist/ is checked in
-dist/F4SE/Plugins/FlexRevive.dll
 
 # Editor and tooling
 .vs/
@@ -20,3 +18,27 @@ __pycache__/
 # Local captures and scratch
 fo4-debug.txt
 backup-*/
+*.bundle
+
+# Release artefacts, and the staging folder they are built from.
+#
+# dist/ is written by the build and by package.py rather than kept here: the DLL is build
+# output, and every other file in it is a copy of something that already lives in this repo
+# (the ini of the literal in src/Config.cpp, the rest of the files at the root). Keeping the
+# copies meant editing each setting twice, and the shipped changelog had already drifted well
+# behind the real one.
+#
+# packages/ holds the built zips. Release binaries belong on the release page rather than in
+# the history, where they can only ever grow.
+dist/
+packages/
+
+# Developer tools: debugger scripts that attach to a running game, the F11 test kit, the GPU
+# probe. None of it ships, and a batch file that attaches a debugger to another process is
+# exactly the shape of thing a virus scanner objects to in a source download.
+tools/
+
+# Store copy and press material for the Nexus Mods page. Not part of the mod.
+NEXUS_*
+*.jpg
+*.png
