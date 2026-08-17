@@ -28,7 +28,7 @@ if(FXC_EXECUTABLE)
     file(MAKE_DIRECTORY ${SHADER_OUT})
     # Each name yields shaders/<name>.hlsl -> <name>_cs.h, declaring g_<name>CS. The generated
     # header is what declares the blob, so nothing has to restate its length by hand.
-    set(FLEXREVIVE_SHADERS integrate sweep)
+    set(FLEXREVIVE_SHADERS integrate sweep pairs settle carry)
     foreach(name ${FLEXREVIVE_SHADERS})
         add_custom_command(
             OUTPUT ${SHADER_OUT}/${name}_cs.h
@@ -71,6 +71,7 @@ add_library(FlexRevive SHARED
     src/f4kit/ThreadPool.cpp
     src/gpu/Device.cpp
     src/gpu/GpuSolver.cpp
+    src/gpu/Scene.cpp
     src/version.rc
     ${FLEXREVIVE_SHADER_HEADERS}
 )
@@ -141,6 +142,9 @@ if(FLEXREVIVE_TESTS)
     flexrevive_test(test_piecegrid src/PieceGrid.cpp)
     flexrevive_test(test_imports  src/f4kit/ImportHook.cpp)
     flexrevive_test(test_threadpool src/f4kit/ThreadPool.cpp)
+    # The marshalling needs no graphics device, so it is tested like any other
+    # pure code rather than being reached only through a card.
+    flexrevive_test(test_gpuscene src/gpu/Scene.cpp src/PieceGrid.cpp)
 
     # The GPU suite talks to a real device, so it needs the shader headers and skips itself
     # cleanly on a machine that has no capable adapter.
