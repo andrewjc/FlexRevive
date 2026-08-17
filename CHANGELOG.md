@@ -9,6 +9,10 @@
 * Changed the force field log to fire when a blast begins rather than on every call, so it described the first explosion of a session four times over and no later one at all
 * Added a blast line reporting how many settled pieces a force field disturbed, so a blast that arrives and reaches nothing is distinguishable from one that never arrived
 * Changed the wake trace to count blasts separately from movers, which shared a counter and were reported as one
+* Fixed the source archive carrying tools/, whose debugger scripts attach to a running game and read to a virus scanner exactly as that sounds, and NEXUS_SUMMARY.txt, which is store copy rather than part of the mod
+* Added package.py, which builds both archives from a named list of files rather than from whatever is in the working tree, so nothing new ships without being asked for
+* Fixed the source archive shipping without src/version.rc, which CMakeLists.txt builds, so nobody who downloaded it could compile it
+* Added a check that the source archive contains every file CMakeLists.txt names. Packaging fails rather than producing an archive that will not build
 
 ## 1.1.1
 

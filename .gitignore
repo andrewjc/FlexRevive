@@ -15,6 +15,7 @@ dist/F4SE/Plugins/FlexRevive.dll
 .vs/
 .vscode/
 *.user
+__pycache__/
 
 # Local captures and scratch
 fo4-debug.txt
